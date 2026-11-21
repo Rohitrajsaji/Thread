@@ -847,3 +847,409 @@ def test_doctor_spike_generates_report_and_handles_missing_cli(tmp_path: Path) -
     assert "Pre-write scope block (CLI)" in result.output
     assert "PausedQuota zero-retry simulation" in result.output
     assert report_out.is_file()
+
+
+# ---------------------------------------------------------------------------
+# 8. Iteration 2 Regression Tests (Security, SDK, CLI, Redactor, Hardening)
+# ---------------------------------------------------------------------------
+
+
+def test_sdk_send_and_wait_and_nonblocking_send_lifecycle(tmp_path: Path) -> None:
+    """Verify send_and_wait() is preferred and non-blocking send() waits for session.idle."""
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    policy = RolePolicy(role="backend", worktree_root=wt, allowed_paths=["app/**"])
+    asgn = WorkerAssignment(
+        assignment_id="a-life",
+        thread_id="t-1",
+        ticket_id="T1",
+        role="backend",
+        instructions="hello",
+        worktree_path=wt,
+        base_sha="HEAD",
+        timeout_seconds=12.0,
+    )
+
+    # 1. Non-blocking send() that returns immediately while events arrive asynchronously
+    class _AsyncSendSession:
+        def __init__(self) -> None:
+            self._handlers: list[Any] = []
+            self.send_called = False
+
+        def on(self, cb: Any) -> None:
+            self._handlers.append(cb)
+
+        async def send(self, prompt: str) -> str:
+            self.send_called = True
+
+            async def _emit_later() -> None:
+                await asyncio.sleep(0.03)
+                for h in self._handlers:
+                    h({"type": "assistant.message.delta", "data": {"delta_content": "-----BEGIN RSA PRIVATE KEY-----\n"}})
+                    h({"type": "assistant.message.delta", "data": {"delta_content": "MIIEow_CHUNKED_SECRET_BODY\n"}})
+                    h({"type": "assistant.message.delta", "data": {"delta_content": "-----END RSA PRIVATE KEY-----"}})
+                    h({"type": "assistant.message.delta", "data": {"delta_content": "final-ok"}})
+                    h({"type": "session.idle", "data": {}})
+
+            asyncio.create_task(_emit_later())
+            return "msg-id-123"
+
+        async def abort(self) -> None:
+            return None
+
+        async def disconnect(self) -> None:
+            return None
+
+    class _AsyncClient:
+        def __init__(self) -> None:
+            self.session = _AsyncSendSession()
+            self.session_kwargs: dict[str, Any] = {}
+
+        async def create_session(self, **kwargs: Any) -> _AsyncSendSession:
+            self.session_kwargs = kwargs
+            return self.session
+
+    client1 = _AsyncClient()
+    ad1 = CopilotSdkAdapter(policy, client_factory=lambda: client1)
+
+    async def _run_async_send() -> list[Any]:
+        await ad1.start(asgn)
+        try:
+            return [e async for e in ad1.stream_events()]
+        finally:
+            await ad1.disconnect()
+
+    evts = asyncio.run(_run_async_send())
+    assert client1.session.send_called is True
+    msgs = [e.message for e in evts if e.type == "assistant_message"]
+    assert "final-ok" in msgs
+    assert all("MIIEow_CHUNKED_SECRET_BODY" not in m for m in msgs)
+
+    # 2. send_and_wait() is preferred when present and receives timeout
+    class _SendAndWaitSession:
+        def __init__(self) -> None:
+            self._handlers: list[Any] = []
+            self.seen_timeout: float | None = None
+
+        def on(self, cb: Any) -> None:
+            self._handlers.append(cb)
+
+        async def send(self, prompt: str) -> str:
+            raise AssertionError("send() should not be called when send_and_wait() exists")
+
+        async def send_and_wait(self, prompt: str, *, timeout: float = 60.0) -> None:
+            self.seen_timeout = timeout
+            for h in self._handlers:
+                h({"type": "assistant.message", "data": {"content": "waited-ok"}})
+                h({"type": "session.idle", "data": {}})
+
+        async def disconnect(self) -> None:
+            return None
+
+    saw_session = _SendAndWaitSession()
+
+    class _SawClient:
+        async def create_session(self, **kwargs: Any) -> _SendAndWaitSession:
+            return saw_session
+
+    ad2 = CopilotSdkAdapter(policy, client_factory=lambda: _SawClient())
+
+    async def _run_saw() -> list[Any]:
+        await ad2.start(asgn)
+        try:
+            return [e async for e in ad2.stream_events()]
+        finally:
+            await ad2.disconnect()
+
+    evts2 = asyncio.run(_run_saw())
+    assert saw_session.seen_timeout == 12.0
+    assert any(e.type == "assistant_message" and e.message == "waited-ok" for e in evts2)
+
+
+def test_sdk_permission_request_extracts_args_and_readonly_excluded_tools(tmp_path: Path) -> None:
+    """Verify PermissionRequestCustomTool/Mcp .args inspection and full readonly excluded_tools."""
+    from copilot.generated.session_events import PermissionRequestCustomTool, PermissionRequestMcp
+
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    be_policy = RolePolicy(role="backend", worktree_root=wt, allowed_paths=["app/**"])
+    sdk = CopilotSdkAdapter(be_policy)
+
+    for req in (
+        PermissionRequestCustomTool(
+            tool_description="read file",
+            tool_name="read_file",
+            args={"path": "/etc/passwd"},
+        ),
+        PermissionRequestMcp(
+            read_only=True,
+            server_name="fs",
+            tool_name="read_file",
+            tool_title="Read File",
+            args={"path": "/etc/passwd"},
+        ),
+    ):
+        decision = asyncio.run(sdk._on_permission_request(req))
+        assert getattr(decision, "kind", None) == "denied-by-rules"
+
+    # Readonly excluded_tools aligns with _WRITE_TOOLS
+    ro_policy = RolePolicy.from_scope_config("reviewer_readonly", ScopeConfig(), wt)
+    captured_kwargs: dict[str, Any] = {}
+
+    class _CapSession:
+        def on(self, cb: Any) -> None:
+            self._cb = cb
+
+        async def send_and_wait(self, prompt: str, *, timeout: float = 60.0) -> None:
+            self._cb({"type": "session.idle", "data": {}})
+
+        async def disconnect(self) -> None:
+            return None
+
+    class _CapClient:
+        async def create_session(self, **kwargs: Any) -> _CapSession:
+            captured_kwargs.update(kwargs)
+            return _CapSession()
+
+    ro_sdk = CopilotSdkAdapter(ro_policy, client_factory=lambda: _CapClient())
+    asgn = WorkerAssignment(
+        assignment_id="a-ro-ex",
+        thread_id="t-1",
+        ticket_id="T1",
+        role="reviewer_readonly",
+        instructions="review",
+        worktree_path=wt,
+        base_sha="HEAD",
+    )
+
+    async def _run() -> None:
+        await ro_sdk.start(asgn)
+        try:
+            async for _ in ro_sdk.stream_events():
+                pass
+        finally:
+            await ro_sdk.disconnect()
+
+    asyncio.run(_run())
+    excluded = set(captured_kwargs.get("excluded_tools", []))
+    for expected_tool in ("delete", "unlink", "move", "rename", "fs_create", "file_save", "apply_patch"):
+        assert expected_tool in excluded
+
+
+def test_cli_adapter_scrubs_multiline_pem_and_quotes_hook_executable(tmp_path: Path) -> None:
+    """Verify StreamRedactor per CLI pipe prevents multi-line PEM leakage in events, logs, and SQLite."""
+    repo = tmp_path / "repo"
+    base_sha = _init_git_repo(repo)
+    db = StateDatabase(repo_root=repo)
+    sr = StateRepository(db)
+    sr.create_thread(ThreadRecord(id="thr-pem", title="PEM", base_sha=base_sha))
+    sr.create_ticket(TicketRecord(id="T-PEM", thread_id="thr-pem", title="PEM", role="backend"))
+
+    cli_script = "\n".join(
+        [
+            "print('-----BEGIN RSA PRIVATE KEY-----')",
+            "print('MIIEowIBAAKCAQEA_LEAKED_PRIVATE_KEY_BODY_LINE_1')",
+            "print('MIIEowIBAAKCAQEA_LEAKED_PRIVATE_KEY_BODY_LINE_2')",
+            "print('-----END RSA PRIVATE KEY-----')",
+            "print('safe-output-after-pem')",
+        ]
+    )
+    mgr = WorkerManager(
+        repo_root=repo,
+        db=db,
+        policy=PolicyConfig(),
+        scope=ScopeConfig(),
+        adapter_factory=lambda pol: CopilotCliSubprocessAdapter(
+            pol,
+            command_builder=lambda _a, _cfg: [sys.executable, "-c", cli_script],
+        ),
+    )
+    res = asyncio.run(mgr.dispatch_ticket("thr-pem", "T-PEM", "run"))
+    assert res.log_path is not None
+    log_text = (repo / res.log_path).read_text(encoding="utf-8")
+    assert "MIIEowIBAAKCAQEA_LEAKED_PRIVATE_KEY_BODY_LINE_1" not in log_text
+    assert "MIIEowIBAAKCAQEA_LEAKED_PRIVATE_KEY_BODY_LINE_2" not in log_text
+    assert "safe-output-after-pem" in log_text
+
+    with sqlite3.connect(db.db_path) as conn:
+        all_events = "\n".join(r[0] for r in conn.execute("SELECT payload_json FROM events").fetchall())
+    assert "MIIEowIBAAKCAQEA_LEAKED_PRIVATE_KEY_BODY_LINE_1" not in all_events
+    assert "MIIEowIBAAKCAQEA_LEAKED_PRIVATE_KEY_BODY_LINE_2" not in all_events
+
+    # Verify guard.json quotes sys.executable and readonly denies full write-tool list
+    ro_policy = RolePolicy.from_scope_config("reviewer_readonly", ScopeConfig(), tmp_path)
+    ro_cli = CopilotCliSubprocessAdapter(ro_policy)
+    asgn = WorkerAssignment(
+        assignment_id="a-guard",
+        thread_id="t",
+        ticket_id="T",
+        role="reviewer_readonly",
+        instructions="review",
+        worktree_path=tmp_path,
+        base_sha="HEAD",
+    )
+    runtime_path, _, _ = ro_cli._prepare_runtime_files(asgn)
+    try:
+        guard = json.loads((runtime_path / "hooks" / "guard.json").read_text(encoding="utf-8"))
+        import shlex
+
+        expected_prefix = f"{shlex.quote(sys.executable)} -m thread_sdlc.workers.permissions"
+        assert guard["hooks"]["preToolUse"][0]["bash"] == expected_prefix
+    finally:
+        if ro_cli._runtime_dir is not None:
+            ro_cli._runtime_dir.cleanup()
+            ro_cli._runtime_dir = None
+
+
+def test_role_policy_iteration2_hardening(tmp_path: Path) -> None:
+    """Verify mutating tools, Move to/rename to, --output, python -c, and macOS symlink prefixes."""
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    (wt / "app").mkdir()
+    be = RolePolicy(
+        role="backend",
+        worktree_root=wt,
+        allowed_paths=["app/**", "tests/**"],
+        denied_paths=[".thread/policy.yaml"],
+        allowed_shell_prefixes=["pytest", "python", "ruff", "git status", "git diff"],
+    )
+    ro = RolePolicy.from_scope_config("reviewer_readonly", ScopeConfig(), wt)
+
+    # Unlisted mutating tools & unknown tools with path args must be write-checked
+    for tool_name in ("delete", "unlink", "unlink_file", "move", "move_file", "rename", "fs_create", "file_save", "custom_opaque_tool"):
+        with pytest.raises(ScopeViolationError):
+            be.enforce_tool_call(tool_name, {"path": ".thread/policy.yaml"})
+
+    # apply_patch Move to: and git rename to
+    with pytest.raises(ScopeViolationError):
+        be.enforce_tool_call(
+            "apply_patch",
+            {"input": "*** Begin Patch\n*** Update File: app/ok.py\n*** Move to: .thread/policy.yaml\n*** End Patch"},
+        )
+    with pytest.raises(ScopeViolationError):
+        be.enforce_tool_call(
+            "apply_patch",
+            {"diff": "diff --git a/app/a.py b/.thread/policy.yaml\nrename from app/a.py\nrename to .thread/policy.yaml"},
+        )
+
+    # reviewer_readonly rejects --output and --ext-diff on git read commands
+    for ro_bad in (
+        "git diff --output=pwned.txt",
+        "git diff --output pwned.txt",
+        "git log --output=pwned.txt",
+        "git show --output=pwned.txt",
+        "git diff --ext-diff",
+    ):
+        with pytest.raises(ScopeViolationError):
+            ro.enforce_shell(ro_bad)
+
+    # backend blocks inline python -c / -Bc / node -e and --flag=outside paths
+    for be_bad in (
+        'python -c "open(\'.thread/policy.yaml\', \'w\').write(\'x\')"',
+        'python -Bc "print(1)"',
+        'python3.11 -c"print(1)"',
+        'python -W ignore -c "print(1)"',
+        "git diff --output=../outside.txt",
+        "git diff --output .thread/policy.yaml",
+        "pytest --rootdir=../outside",
+    ):
+        with pytest.raises(ScopeViolationError):
+            be.enforce_shell(be_bad)
+
+    # Normal commands remain allowed
+    assert be.enforce_shell("pytest tests/unit/test_m1_foundation.py")
+    assert be.enforce_shell("python -m pytest -c pyproject.toml")
+    assert be.enforce_shell("ruff check .")
+    assert be.enforce_shell("git status")
+    assert be.enforce_shell("git diff")
+
+    # Unresolved macOS symlink prefix (e.g., /var/... or symlinked parent above worktree_root)
+    alias_parent = tmp_path / "alias_parent"
+    real_parent = tmp_path / "real_parent"
+    real_parent.mkdir()
+    real_wt = real_parent / "wt"
+    real_wt.mkdir()
+    (real_wt / "app").mkdir()
+    alias_parent.symlink_to(real_parent)
+    be_alias = RolePolicy(role="backend", worktree_root=real_wt, allowed_paths=["app/**"])
+    unresolved_target = str(alias_parent / "wt" / "app" / "ok.py")
+    assert be_alias.enforce_write(unresolved_target) == (real_wt / "app" / "ok.py").resolve()
+
+
+def test_redactor_and_event_logger_json_nested_and_env_edge_cases(tmp_path: Path) -> None:
+    """Verify AWS JSON keys, CamelCase SecretAccessKey, escaped private_key, .env #, and valid EventLogger JSON."""
+    aws_secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+    assert aws_secret not in redactor.redact_text(f'{{"aws_secret_access_key": "{aws_secret}"}}')
+    assert aws_secret not in redactor.redact_text(f'{{"SecretAccessKey": "{aws_secret}"}}')
+    assert aws_secret not in redactor.redact_json(f'{{"SecretAccessKey": "{aws_secret}"}}')
+
+    # Safe telemetry keys remain untouched
+    safe_payload = redactor.redact_payload(
+        {
+            "max_tokens": 4096,
+            "turns_used": 3,
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "key_findings": "all good",
+            "SecretAccessKey": aws_secret,
+        }
+    )
+    assert safe_payload["max_tokens"] == 4096
+    assert safe_payload["turns_used"] == 3
+    assert safe_payload["input_tokens"] == 100
+    assert safe_payload["output_tokens"] == 50
+    assert safe_payload["key_findings"] == "all good"
+    assert safe_payload["SecretAccessKey"] == "[REDACTED]"
+
+    # Escaped GCP private_key & nested JSON inside redact_payload
+    escaped_sa = '{"sa": "{\\"private_key\\": \\"SECRET_PEM_BODY\\", \\"private_key_id\\": \\"key_id_99\\"}"}'
+    scrubbed_sa = redactor.redact_text(escaped_sa)
+    assert "SECRET_PEM_BODY" not in scrubbed_sa
+    assert "key_id_99" not in scrubbed_sa
+
+    # Unquoted .env with '#' and escaped double quotes
+    assert redactor.redact_text("DB_PASSWORD=my_pass#withhash123") == "DB_PASSWORD=[REDACTED]"
+    assert redactor.redact_text('DB_PASSWORD="abc\\"def"') == 'DB_PASSWORD="[REDACTED]"'
+    assert redactor.redact_text('{"env":"MY_SECRET=json_str_env_secret_99"}') == '{"env":"MY_SECRET=[REDACTED]"}'
+
+    # EventLogger nested JSON and plain string -> always valid JSON
+    db = StateDatabase(repo_root=tmp_path / "db")
+    logger = EventLogger(db)
+    sec = "json_str_env_secret_99"
+    logger.emit("t1", "nested", json.dumps({"inner": json.dumps({"env": f"APP_SECRET={sec}"})}))
+    logger.emit("t1", "quoted", f'log: {{"env":"MY_SECRET={sec}"}}')
+    logger.emit("t1", "plain", f"plain DB_PASSWORD={sec}")
+
+    with sqlite3.connect(db.db_path) as conn:
+        rows = [r[0] for r in conn.execute("SELECT payload_json FROM events").fetchall()]
+    assert len(rows) == 3
+    for row in rows:
+        assert sec not in row
+        parsed = json.loads(row)
+        assert isinstance(parsed, (dict, list))
+
+
+def test_loader_and_worktree_minor_hardening(tmp_path: Path) -> None:
+    """Verify loader rejects '-' refs and mid-path '..', and WorktreeManager rejects '.' and substring grep."""
+    from thread_sdlc.config import ConfigLoadError
+    from thread_sdlc.workers import WorktreeError, WorktreeManager
+
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with pytest.raises(ConfigLoadError):
+        load_from_git_ref(repo, "--help", ".thread/policy.yaml")
+    with pytest.raises(ConfigLoadError):
+        load_from_git_ref(repo, "main", "foo/../../etc/passwd")
+
+    wm = WorktreeManager(repo)
+    with pytest.raises(WorktreeError):
+        wm.branch_name(".", "T1")
+    with pytest.raises(WorktreeError):
+        wm.branch_name("..", "T1")
+
+    (repo / "x.txt").write_text("x\n", encoding="utf-8")
+    _git(["add", "x.txt"], repo)
+    _git(["commit", "-m", "Commit\n\nThread-Assignment-Id: asgn-10\n\nBody"], repo)
+    assert wm.find_commit_by_assignment_id("asgn-1", repo) is None
+    assert wm.find_commit_by_assignment_id("asgn-10", repo) is not None

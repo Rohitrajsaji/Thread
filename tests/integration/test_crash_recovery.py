@@ -89,10 +89,10 @@ def test_crash_after_commit_reconciles_without_reinvoking_worker(tmp_path: Path)
     assert committed_sha is not None
     assert len(committed_sha) == 40
 
-    # Verify DB assignment was still `running` with `result_sha=None` when crash occurred
+    # Verify handled WorkerExecutionError transitions assignment to `failed` with `result_sha=None`
     pre_restart_asgn = state_repo.get_assignment("asgn-1")
     assert pre_restart_asgn is not None
-    assert pre_restart_asgn.status == "running"
+    assert pre_restart_asgn.status == "failed"
     assert pre_restart_asgn.result_sha is None
 
     # Simulated restart: brand new StateDatabase, WorktreeManager, and WorkerManager
@@ -246,3 +246,108 @@ def test_worker_cannot_merge_into_base_branch(tmp_path: Path) -> None:
     merged_sha = wt_mgr.merge_worktree_human_only("thr-m", "T1", "main", human_authorized=True)
     assert _git(["rev-parse", "main"], repo) == merged_sha
     assert merged_sha != base_sha
+
+
+def test_sigkill_running_assignment_reconciles_even_with_new_assignment_id(tmp_path: Path) -> None:
+    """Hard process kill leaving `status='running'` reconciles prior commit even if new assignment_id is passed."""
+    repo, base_sha = _setup_repo(tmp_path)
+    db = StateDatabase(repo_root=repo)
+    sr = StateRepository(db)
+    sr.create_thread(ThreadRecord(id="thr-kill", title="SIGKILL", base_sha=base_sha))
+    sr.create_ticket(TicketRecord(id="T1", thread_id="thr-kill", title="T1", role="backend"))
+
+    wt_mgr = WorktreeManager(repo)
+    wt_info = wt_mgr.ensure_worktree("thr-kill", "T1", base_ref=base_sha)
+    (wt_info.path / "app").mkdir(parents=True, exist_ok=True)
+    (wt_info.path / "app" / "work.py").write_text("OK = True\n", encoding="utf-8")
+    committed_sha = wt_mgr.commit_worktree(wt_info.path, "Committed before SIGKILL", "asgn-old")
+
+    from thread_sdlc.state import AssignmentRecord
+
+    sr.create_assignment(
+        AssignmentRecord(
+            id="asgn-old",
+            ticket_id="T1",
+            adapter_type="MockWorkerAdapter",
+            status="running",
+            base_sha=base_sha,
+            commit_trailer="Thread-Assignment-Id: asgn-old",
+        )
+    )
+
+    restarted_adapters: list[MockWorkerAdapter] = []
+    mgr = WorkerManager(
+        repo_root=repo,
+        db=StateDatabase(repo_root=repo),
+        policy=PolicyConfig(),
+        scope=ScopeConfig(),
+        adapter_factory=lambda pol: (restarted_adapters.append(MockWorkerAdapter(pol)) or restarted_adapters[-1]),
+    )
+    res = asyncio.run(mgr.dispatch_ticket("thr-kill", "T1", "resume", assignment_id="asgn-new"))
+    assert res.reconciled is True
+    assert res.status == "reconciled_completed"
+    assert res.result_sha == committed_sha
+    assert res.worker_invoked is False
+    assert len(restarted_adapters) == 0
+    assert sr.get_assignment("asgn-old").status == "reconciled_completed"
+
+
+def test_pre_commit_failure_marks_failed_allows_retry_and_enforces_retry_limit(
+    tmp_path: Path,
+) -> None:
+    """Pre-commit exceptions mark assignment/ticket failed, emit assignment_failed, allow retry, and enforce max_retries_per_ticket."""
+    from thread_sdlc.workers import ScopeViolationError, WorkerRetryLimitError
+
+    repo, base_sha = _setup_repo(tmp_path)
+    db = StateDatabase(repo_root=repo)
+    sr = StateRepository(db)
+    sr.create_thread(ThreadRecord(id="thr-fail", title="Retry", base_sha=base_sha))
+    sr.create_ticket(TicketRecord(id="T-F1", thread_id="thr-fail", title="F1", role="backend"))
+    sr.create_ticket(TicketRecord(id="T-F2", thread_id="thr-fail", title="F2", role="backend"))
+
+    policy = PolicyConfig()
+    policy.caps.max_workers_per_thread = 1
+    policy.caps.max_retries_per_ticket = 1
+
+    mgr_bad = WorkerManager(
+        repo_root=repo,
+        db=db,
+        policy=policy,
+        scope=ScopeConfig(),
+        adapter_factory=lambda pol: MockWorkerAdapter(pol, scenario="out_of_scope_write"),
+    )
+
+    with pytest.raises(ScopeViolationError):
+        asyncio.run(mgr_bad.dispatch_ticket("thr-fail", "T-F1", "attempt 1"))
+
+    failed_asgn = sr.get_latest_assignment_for_ticket("T-F1")
+    assert failed_asgn is not None
+    assert failed_asgn.status == "failed"
+    assert failed_asgn.ended_at is not None
+    assert sr.get_ticket("T-F1").status == "failed"
+    assert sr.count_active_assignments("thr-fail") == 0
+    assert any(e.type == "assignment_failed" for e in mgr_bad.events.list_events("thr-fail"))
+
+    # Another ticket on the same thread is NOT wedged by WorkerConcurrencyError
+    mgr_good = WorkerManager(
+        repo_root=repo,
+        db=db,
+        policy=policy,
+        scope=ScopeConfig(),
+        adapter_factory=lambda pol: MockWorkerAdapter(pol, scenario="commit_success"),
+    )
+    ok_res = asyncio.run(mgr_good.dispatch_ticket("thr-fail", "T-F2", "other ticket"))
+    assert ok_res.status == "completed"
+
+    # Retrying T-F1 succeeds while within retry budget (1 failed < max_retries=1? wait: 1 <= 1 allowed)
+    res_retry = asyncio.run(mgr_good.dispatch_ticket("thr-fail", "T-F1", "retry valid"))
+    assert res_retry.status == "completed"
+
+    # Exhausting max_retries_per_ticket=1 (2 failures > 1) raises WorkerRetryLimitError
+    sr.create_ticket(TicketRecord(id="T-F3", thread_id="thr-fail", title="F3", role="backend"))
+    for _ in range(2):
+        with pytest.raises(ScopeViolationError):
+            asyncio.run(mgr_bad.dispatch_ticket("thr-fail", "T-F3", "bad attempt"))
+
+    with pytest.raises(WorkerRetryLimitError):
+        asyncio.run(mgr_bad.dispatch_ticket("thr-fail", "T-F3", "exceeded retries"))

@@ -16,20 +16,39 @@ _WRITE_TOOLS = frozenset(
     {
         "write",
         "write_file",
+        "write_to_file",
         "edit",
         "edit_file",
         "create",
         "create_file",
+        "fs_create",
+        "delete",
         "delete_file",
+        "remove",
         "remove_file",
+        "unlink",
+        "unlink_file",
+        "move",
+        "move_file",
+        "rename",
+        "rename_file",
+        "copy",
+        "copy_file",
         "patch",
         "apply_patch",
         "replace_file_content",
         "multi_replace_file_content",
         "str_replace_editor",
         "insert_edit_into_file",
-        "rename_file",
         "save_file",
+        "file_save",
+        "rm",
+        "mv",
+        "cp",
+        "mkdir",
+        "rmdir",
+        "touch",
+        "truncate",
     }
 )
 
@@ -115,14 +134,21 @@ _PATH_ARG_KEYS = (
     "filePath",
     "target_path",
     "targetPath",
+    "target_file",
+    "TargetFile",
     "filename",
     "file",
-    "destination",
-    "old_path",
-    "new_path",
-    "TargetFile",
     "file_name",
     "resolved_path",
+    "destination",
+    "dest",
+    "dst",
+    "source",
+    "src",
+    "old_path",
+    "oldPath",
+    "new_path",
+    "newPath",
     "directory",
     "dir",
 )
@@ -237,15 +263,31 @@ def _extract_patch_paths(patch_text: str) -> list[str]:
     paths: list[str] = []
     for raw_line in patch_text.splitlines():
         line = raw_line.strip()
+        lower = line.lower()
         for prefix in ("+++ b/", "--- a/", "+++ ", "--- "):
             if line.startswith(prefix):
                 candidate = line[len(prefix) :].split("\t", 1)[0].strip()
+                if len(candidate) >= 2 and candidate.startswith('"') and candidate.endswith('"'):
+                    candidate = candidate[1:-1]
                 if candidate and candidate != "/dev/null":
                     paths.append(candidate)
                 break
-        for marker in ("*** Update File: ", "*** Add File: ", "*** Delete File: "):
-            if line.startswith(marker):
+        for marker in (
+            "*** update file:",
+            "*** add file:",
+            "*** delete file:",
+            "*** move to:",
+        ):
+            if lower.startswith(marker):
                 candidate = line[len(marker) :].strip()
+                if candidate:
+                    paths.append(candidate)
+                break
+        for git_marker in ("rename from ", "rename to ", "copy from ", "copy to "):
+            if line.startswith(git_marker):
+                candidate = line[len(git_marker) :].strip()
+                if len(candidate) >= 2 and candidate.startswith('"') and candidate.endswith('"'):
+                    candidate = candidate[1:-1]
                 if candidate:
                     paths.append(candidate)
                 break
@@ -347,7 +389,11 @@ class RolePolicy:
                         raw,
                         "Symlink escapes worktree root",
                     ) from exc
-            if probe == self.worktree_root or probe.parent == probe:
+            if (
+                probe == self.worktree_root
+                or probe.resolve(strict=False) == self.worktree_root
+                or probe.parent == probe
+            ):
                 break
             probe = probe.parent
 
@@ -440,10 +486,23 @@ class RolePolicy:
             raise ScopeViolationError(self.role, "shell", command, "Empty command tokens")
 
         exe = Path(tokens[0]).name
+        exe_lower = exe.lower()
 
         # Prevent git merge / push / rebase / worktree and external repo flags
-        if exe == "git":
+        if exe_lower == "git":
+            expect_git_output = False
             for i, tok in enumerate(tokens[1:], start=1):
+                if expect_git_output:
+                    expect_git_output = False
+                    if self.readonly:
+                        raise ScopeViolationError(
+                            self.role,
+                            "shell",
+                            command,
+                            "Read-only role cannot use file-writing git flag '--output'",
+                        )
+                    self.enforce_write(tok)
+                    continue
                 if tok == "-C" and i + 1 < len(tokens):
                     self.enforce_read(tokens[i + 1])
                 elif tok.startswith("-C") and len(tok) > 2:
@@ -455,6 +514,37 @@ class RolePolicy:
                     raise ScopeViolationError(
                         self.role, "shell", command, f"Flag {tok!r} is disallowed"
                     )
+                elif tok == "--output":
+                    if self.readonly:
+                        raise ScopeViolationError(
+                            self.role,
+                            "shell",
+                            command,
+                            "Read-only role cannot use file-writing git flag '--output'",
+                        )
+                    if i + 1 >= len(tokens):
+                        raise ScopeViolationError(
+                            self.role, "shell", command, "Missing target path for '--output'"
+                        )
+                    expect_git_output = True
+                elif tok.startswith("--output="):
+                    if self.readonly:
+                        raise ScopeViolationError(
+                            self.role,
+                            "shell",
+                            command,
+                            "Read-only role cannot use file-writing git flag '--output'",
+                        )
+                    _, out_val = tok.split("=", 1)
+                    self.enforce_write(out_val)
+                elif tok == "--ext-diff" or tok.startswith("--ext-diff="):
+                    if self.readonly:
+                        raise ScopeViolationError(
+                            self.role,
+                            "shell",
+                            command,
+                            "Read-only role cannot use git '--ext-diff' flag",
+                        )
 
             subcmd = next((t for t in tokens[1:] if not t.startswith("-")), None)
             if subcmd in _FORBIDDEN_GIT_SUBCOMMANDS:
@@ -472,25 +562,81 @@ class RolePolicy:
                     f"Read-only role cannot execute mutating git command 'git {subcmd}'",
                 )
 
+        # Restrict inline code execution flags for python/node across all roles
+        if exe_lower == "python" or exe_lower.startswith("python3") or exe_lower.startswith("python2"):
+            skip_next_py = False
+            for tok in tokens[1:]:
+                if skip_next_py:
+                    skip_next_py = False
+                    continue
+                if tok == "--":
+                    break
+                if tok == "-m" or (tok.startswith("-m") and not tok.startswith("--")):
+                    break
+                if tok in ("-W", "-X", "--check-hash-based-pycs"):
+                    skip_next_py = True
+                    continue
+                if not tok.startswith("-"):
+                    break
+                if not tok.startswith("--") and "c" in tok[1:]:
+                    raise ScopeViolationError(
+                        self.role,
+                        "shell",
+                        command,
+                        "Inline 'python -c' code execution is disallowed",
+                    )
+
+        if exe_lower in ("node", "nodejs"):
+            skip_next_node = False
+            for tok in tokens[1:]:
+                if skip_next_node:
+                    skip_next_node = False
+                    continue
+                if tok == "--":
+                    break
+                if tok in ("-r", "--require", "--import", "--loader"):
+                    skip_next_node = True
+                    continue
+                if not tok.startswith("-"):
+                    break
+                if tok in ("-e", "--eval", "-p", "--print") or tok.startswith(
+                    ("--eval=", "--print=")
+                ):
+                    raise ScopeViolationError(
+                        self.role,
+                        "shell",
+                        command,
+                        "Inline 'node -e/--eval' code execution is disallowed",
+                    )
+                if not tok.startswith("--") and ("e" in tok[1:] or "p" in tok[1:]):
+                    raise ScopeViolationError(
+                        self.role,
+                        "shell",
+                        command,
+                        "Inline 'node -e/-p' code execution is disallowed",
+                    )
+
         if self.readonly:
-            if exe in _READONLY_MUTATING_CMDS:
+            if exe_lower in _READONLY_MUTATING_CMDS:
                 raise ScopeViolationError(
                     self.role,
                     "shell",
                     command,
                     f"Read-only role cannot execute mutating command {exe!r}",
                 )
-            if exe in ("sed",) and any(t == "-i" or t.startswith("-i") for t in tokens[1:]):
+            if exe_lower == "sed" and any(t == "-i" or t.startswith("-i") for t in tokens[1:]):
                 raise ScopeViolationError(
                     self.role, "shell", command, "Read-only role cannot run 'sed -i'"
                 )
-            if exe in ("python", "python3") and any(t == "-c" for t in tokens[1:]):
+            if any(
+                t == "--output" or t.startswith("--output=") or t == "--ext-diff"
+                for t in tokens[1:]
+            ):
                 raise ScopeViolationError(
-                    self.role, "shell", command, "Read-only role cannot run inline 'python -c'"
-                )
-            if exe == "node" and any(t in ("-e", "--eval") for t in tokens[1:]):
-                raise ScopeViolationError(
-                    self.role, "shell", command, "Read-only role cannot run inline 'node -e'"
+                    self.role,
+                    "shell",
+                    command,
+                    "Read-only role cannot use file-writing '--output' / '--ext-diff' flags",
                 )
 
         if not self.allowed_shell_prefixes:
@@ -518,17 +664,57 @@ class RolePolicy:
                 f"Command {command!r} does not match allowed_shell_prefixes {self.allowed_shell_prefixes}",
             )
 
-        # Ensure path-like tokens cannot traverse outside worktree_root
+        # Ensure path-like tokens (including --flag=path and glued -Xpath) stay contained
         for tok in tokens[1:]:
             if tok.startswith("-"):
+                if "=" in tok:
+                    flag_name, flag_val = tok.split("=", 1)
+                    candidates = [flag_val]
+                    if ":" in flag_val and not (len(flag_val) >= 2 and flag_val[1] == ":"):
+                        candidates.extend(seg for seg in flag_val.split(":") if seg)
+                    for cand in candidates:
+                        if "/" in cand or "\\" in cand or ".." in cand or Path(cand).is_absolute():
+                            file_part = cand.split("::", 1)[0]
+                            if file_part:
+                                if flag_name in ("--output", "--log-file", "--junitxml", "--junit-xml"):
+                                    self.enforce_write(file_part)
+                                else:
+                                    self._resolve_and_check_containment(file_part, "read")
+                elif len(tok) > 2 and not tok.startswith("--"):
+                    attached = tok[2:]
+                    if "/" in attached or "\\" in attached or ".." in attached:
+                        file_part = attached.split("::", 1)[0]
+                        if file_part:
+                            self._resolve_and_check_containment(file_part, "read")
                 continue
-            if "/" in tok or "\\" in tok or ".." in tok:
+            if "/" in tok or "\\" in tok or ".." in tok or Path(tok).is_absolute():
                 # Allow pytest nodeids like tests/test_a.py::test_fn by stripping ::nodeid
                 file_part = tok.split("::", 1)[0]
                 if file_part:
                     self._resolve_and_check_containment(file_part, "read")
 
         return tokens
+
+    def _extract_tool_paths(self, args: dict[str, Any]) -> list[str]:
+        extracted: list[str] = []
+        for key in _PATH_ARG_KEYS:
+            val = args.get(key)
+            if isinstance(val, str) and val.strip():
+                extracted.append(val.strip())
+        if isinstance(args.get("paths"), list):
+            extracted.extend(str(p) for p in args["paths"] if str(p).strip())
+        if isinstance(args.get("file_edits"), list):
+            for item in args["file_edits"]:
+                if isinstance(item, dict):
+                    for k in ("file_name", "path", "filePath"):
+                        v = item.get(k)
+                        if isinstance(v, str) and v.strip():
+                            extracted.append(v.strip())
+        for patch_key in ("patch", "diff", "input", "raw"):
+            patch_val = args.get(patch_key)
+            if isinstance(patch_val, str):
+                extracted.extend(_extract_patch_paths(patch_val))
+        return extracted
 
     def enforce_tool_call(
         self, tool_name: str, tool_args: dict[str, Any] | str | None
@@ -549,28 +735,28 @@ class RolePolicy:
         else:
             args = {}
 
-        if norm_name in _WRITE_TOOLS or any(
-            k in norm_name for k in ("write", "edit", "patch", "create_file", "delete_file")
+        if norm_name in _WRITE_TOOLS or (
+            norm_name not in _READ_TOOLS
+            and any(
+                k in norm_name
+                for k in (
+                    "write",
+                    "edit",
+                    "patch",
+                    "create",
+                    "delete",
+                    "remove",
+                    "unlink",
+                    "move",
+                    "rename",
+                    "save",
+                    "mkdir",
+                    "rmdir",
+                    "truncate",
+                )
+            )
         ):
-            extracted: list[str] = []
-            for key in _PATH_ARG_KEYS:
-                val = args.get(key)
-                if isinstance(val, str) and val.strip():
-                    extracted.append(val.strip())
-            if isinstance(args.get("paths"), list):
-                extracted.extend(str(p) for p in args["paths"] if str(p).strip())
-            if isinstance(args.get("file_edits"), list):
-                for item in args["file_edits"]:
-                    if isinstance(item, dict):
-                        for k in ("file_name", "path", "filePath"):
-                            v = item.get(k)
-                            if isinstance(v, str) and v.strip():
-                                extracted.append(v.strip())
-            for patch_key in ("patch", "diff", "input", "raw"):
-                patch_val = args.get(patch_key)
-                if isinstance(patch_val, str):
-                    extracted.extend(_extract_patch_paths(patch_val))
-
+            extracted = self._extract_tool_paths(args)
             if not extracted:
                 raise ScopeViolationError(
                     self.role,
@@ -624,10 +810,9 @@ class RolePolicy:
                 f"Read-only role cannot invoke unrecognized or mutating tool {tool_name!r}",
             )
 
-        for key in _PATH_ARG_KEYS:
-            val = args.get(key)
-            if isinstance(val, str) and val.strip():
-                self.enforce_read(val.strip())
+        # Unrecognized tools carrying path args must be write-checked (fail closed)
+        for target in self._extract_tool_paths(args):
+            self.enforce_write(target)
 
 
 def _run_pre_tool_use_hook() -> int:

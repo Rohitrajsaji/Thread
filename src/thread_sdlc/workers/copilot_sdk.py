@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
+from thread_sdlc.governance import redactor
 from thread_sdlc.workers.adapter import (
     AdapterProbeResult,
     AdapterUnavailableError,
@@ -23,7 +24,12 @@ from thread_sdlc.workers.adapter import (
     WorkerExecutionError,
     is_quota_error,
 )
-from thread_sdlc.workers.permissions import RolePolicy, ScopeViolationError
+from thread_sdlc.workers.permissions import (
+    _SHELL_TOOLS,
+    _WRITE_TOOLS,
+    RolePolicy,
+    ScopeViolationError,
+)
 
 _AUTH_ENV_VARS = (
     "COPILOT_GITHUB_TOKEN",
@@ -123,6 +129,7 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
         self._abort_requested = False
         self._send_task: asyncio.Task[Any] | None = None
         self._closed = False
+        self._stream_redactor = redactor.StreamRedactor()
         self.start_count = 0
 
     def _enqueue_event(
@@ -231,13 +238,19 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
                 self._policy.enforce_shell(cmd)
             elif kind == "read":
                 target = _extract_attr_or_key(request, "path", "resolved_path", "resolvedPath")
-                if isinstance(target, str) and target.strip():
-                    self._policy.enforce_read(target.strip())
+                if not isinstance(target, str) or not target.strip():
+                    raise ScopeViolationError(
+                        self._policy.role,
+                        "read",
+                        "<unknown>",
+                        "Read permission request missing target path (fail closed)",
+                    )
+                self._policy.enforce_read(target.strip())
             else:
                 tool_name = str(
                     _extract_attr_or_key(request, "tool_name", "toolName", "kind") or "unknown"
                 )
-                args = _extract_attr_or_key(request, "arguments", "toolArgs")
+                args = _extract_attr_or_key(request, "args", "arguments", "toolArgs")
                 self._policy.enforce_tool_call(tool_name, args)
         except ScopeViolationError as err:
             self._scope_violation = err
@@ -265,6 +278,9 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
 
         if norm in ("assistant.message.delta", "assistant.message"):
             content = str(_extract_attr_or_key(data, "delta_content", "deltaContent", "content") or "")
+            if content:
+                lines = content.splitlines(keepends=True) or [content]
+                content = "".join(self._stream_redactor.scrub_line(line) for line in lines)
             self._enqueue_event("assistant_message", content, {"sdk_type": event_type})
             return
 
@@ -338,6 +354,7 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
         self._exec_error = None
         self._abort_requested = False
         self._closed = False
+        self._stream_redactor = redactor.StreamRedactor()
 
         if self._client_factory is not None:
             self._client = self._client_factory()
@@ -356,18 +373,9 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
 
         excluded_tools: list[str] | None = None
         if self._policy.readonly:
-            excluded_tools = [
-                "write",
-                "write_file",
-                "edit",
-                "edit_file",
-                "create",
-                "create_file",
-                "delete_file",
-                "apply_patch",
-            ]
+            excluded_tools = sorted(_WRITE_TOOLS)
             if not self._policy.allowed_shell_prefixes:
-                excluded_tools.extend(["bash", "shell", "run_command"])
+                excluded_tools.extend(sorted(_SHELL_TOOLS))
 
         session_kwargs: dict[str, Any] = {
             "working_directory": str(assignment.worktree_path),
@@ -391,12 +399,19 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
             {"assignment_id": assignment.assignment_id},
         )
 
-        if hasattr(self._session, "send"):
-            self._send_task = asyncio.create_task(self._run_send(assignment.instructions))
+        if hasattr(self._session, "send_and_wait") or hasattr(self._session, "send"):
+            self._send_task = asyncio.create_task(
+                self._run_send(assignment.instructions, timeout=assignment.timeout_seconds)
+            )
 
-    async def _run_send(self, prompt: str) -> None:
+    async def _run_send(self, prompt: str, *, timeout: float = 600.0) -> None:
         try:
-            await self._session.send(prompt)
+            if hasattr(self._session, "send_and_wait"):
+                await self._session.send_and_wait(prompt, timeout=timeout)
+                if not self._closed:
+                    self._finish_stream()
+            else:
+                await self._session.send(prompt)
         except asyncio.CancelledError:
             pass
         except PausedQuota as pq:
@@ -416,9 +431,6 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
             else:
                 self._exec_error = WorkerExecutionError(str(exc))
             self._finish_stream()
-        else:
-            if not self._closed:
-                self._finish_stream()
 
     async def stream_events(self) -> AsyncIterator[WorkerEvent]:
         while True:

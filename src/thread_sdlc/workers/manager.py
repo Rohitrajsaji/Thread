@@ -129,14 +129,23 @@ class WorkerManager:
     ) -> ReconcileResult | None:
         """Reconcile the latest (or specified) assignment for ``ticket_id`` before dispatch."""
         target_assignment_id = assignment_id
-        existing = (
-            self.repo.get_assignment(assignment_id)
-            if assignment_id
-            else self.repo.get_latest_assignment_for_ticket(ticket_id)
-        )
+        existing = self.repo.get_assignment(assignment_id) if assignment_id else None
 
         if existing is not None:
-            return self.reconcile_assignment(existing.id)
+            res = self.reconcile_assignment(existing.id)
+            if res.reconciled and res.result_sha:
+                return res
+
+        latest = self.repo.get_latest_assignment_for_ticket(ticket_id)
+        if latest is not None and (existing is None or latest.id != existing.id):
+            latest_res = self.reconcile_assignment(latest.id)
+            if latest_res.reconciled and latest_res.result_sha:
+                return latest_res
+            if existing is None and target_assignment_id is None:
+                return latest_res
+
+        if existing is not None:
+            return res
 
         if target_assignment_id is None:
             return None
@@ -374,6 +383,34 @@ class WorkerManager:
                 pq=pq,
                 credits_delta=usage_now.credits_used,
                 turns_delta=usage_now.turns_used,
+            )
+            raise
+        except Exception as exc:
+            usage_now = adapter.usage_metrics()
+            self.repo.update_assignment(
+                asgn_id,
+                status="failed",
+                turns_used=usage_now.turns_used,
+                credits_used=usage_now.credits_used,
+                ended_at=utc_now_iso(),
+            )
+            self.repo.increment_thread_usage(
+                thread_id,
+                credits_delta=usage_now.credits_used,
+                turns_delta=usage_now.turns_used,
+            )
+            self.repo.update_ticket(ticket_id, status="failed")
+            self.events.emit(
+                thread_id,
+                "assignment_failed",
+                {
+                    "assignment_id": asgn_id,
+                    "ticket_id": ticket_id,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "turns_used": usage_now.turns_used,
+                    "credits_used": usage_now.credits_used,
+                },
             )
             raise
         finally:

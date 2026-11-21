@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import shutil
 import signal
 import sys
@@ -26,7 +27,12 @@ from thread_sdlc.workers.adapter import (
     WorkerExecutionError,
     is_quota_error,
 )
-from thread_sdlc.workers.permissions import RolePolicy, ScopeViolationError
+from thread_sdlc.workers.permissions import (
+    _SHELL_TOOLS,
+    _WRITE_TOOLS,
+    RolePolicy,
+    ScopeViolationError,
+)
 
 _AUTH_ENV_VARS = (
     "COPILOT_GITHUB_TOKEN",
@@ -129,7 +135,7 @@ class CopilotCliSubprocessAdapter(BaseWorkerAdapter):
                 "preToolUse": [
                     {
                         "type": "command",
-                        "bash": f"{sys.executable} -m thread_sdlc.workers.permissions",
+                        "bash": f"{shlex.quote(sys.executable)} -m thread_sdlc.workers.permissions",
                         "timeoutSec": 10,
                     }
                 ]
@@ -162,10 +168,11 @@ class CopilotCliSubprocessAdapter(BaseWorkerAdapter):
             "shell(git push)",
         ]
         if self._policy.readonly:
-            for tool in ("write", "edit", "create", "delete", "apply_patch"):
+            for tool in sorted(_WRITE_TOOLS):
                 argv.extend(["--deny-tool", tool])
             if not self._policy.allowed_shell_prefixes:
-                argv.extend(["--deny-tool", "shell"])
+                for shell_tool in sorted(_SHELL_TOOLS):
+                    argv.extend(["--deny-tool", shell_tool])
         return argv
 
     def _check_violation_sentinel(self) -> ScopeViolationError | None:
@@ -239,14 +246,15 @@ class CopilotCliSubprocessAdapter(BaseWorkerAdapter):
         if stream is None:
             await queue.put(None)
             return
+        pipe_redactor = redactor.StreamRedactor()
         try:
             while True:
                 raw = await stream.readline()
                 if not raw:
                     break
                 line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
-                # Scrub IMMEDIATELY before buffering or emitting anywhere
-                scrubbed = redactor.redact_text(line)
+                # Scrub IMMEDIATELY before buffering or emitting anywhere (stateful across PEM lines)
+                scrubbed = pipe_redactor.scrub_line(line)
                 await queue.put((stream_name, scrubbed))
         finally:
             await queue.put(None)

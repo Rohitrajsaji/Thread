@@ -103,17 +103,22 @@ def load_all(repo_root: Path) -> ThreadBundle:
 
 def load_from_git_ref(repo_root: Path, base_ref: str, rel_path: str) -> str:
     """Load a file verbatim from Git history using ``git show <base_ref>:<rel_path>``."""
-    if not base_ref or not base_ref.strip():
-        raise ConfigLoadError("base_ref must be a non-empty Git ref or SHA")
+    clean_ref = base_ref.strip() if base_ref else ""
+    if not clean_ref or clean_ref.startswith("-"):
+        raise ConfigLoadError(f"Invalid git base_ref: {base_ref!r}")
     normalized = rel_path.replace("\\", "/").lstrip("/")
     posix_path = PurePosixPath(normalized).as_posix()
     if posix_path.startswith("./"):
         posix_path = posix_path[2:]
-    if not posix_path or posix_path == "." or posix_path.startswith("../"):
+    if (
+        not posix_path
+        or posix_path == "."
+        or ".." in PurePosixPath(posix_path).parts
+    ):
         raise ConfigLoadError(f"Invalid relative git path: {rel_path!r}")
 
     proc = subprocess.run(
-        ["git", "show", f"{base_ref}:{posix_path}"],
+        ["git", "show", f"{clean_ref}:{posix_path}"],
         cwd=repo_root,
         capture_output=True,
         text=True,
@@ -122,7 +127,7 @@ def load_from_git_ref(repo_root: Path, base_ref: str, rel_path: str) -> str:
     )
     if proc.returncode != 0:
         raise ConfigLoadError(
-            f"Failed to load '{posix_path}' from git ref '{base_ref}': {proc.stderr.strip()}"
+            f"Failed to load '{posix_path}' from git ref '{clean_ref}': {proc.stderr.strip()}"
         )
     return proc.stdout
 
@@ -146,8 +151,11 @@ def load_rules_map_from_git_ref(repo_root: Path, base_ref: str) -> RulesMap:
 
 
 def _rev_parse_commit(repo_root: Path, ref: str) -> str | None:
+    clean_ref = ref.strip() if ref else ""
+    if not clean_ref or clean_ref.startswith("-"):
+        return None
     proc = subprocess.run(
-        ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
+        ["git", "rev-parse", "--verify", f"{clean_ref}^{{commit}}"],
         cwd=repo_root,
         capture_output=True,
         text=True,

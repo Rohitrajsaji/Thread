@@ -48,7 +48,7 @@ class ReconcileResult(BaseModel):
 
 
 def _validate_id(value: str, label: str) -> str:
-    if not value or not _SAFE_ID_RE.match(value) or ".." in value:
+    if not value or value in (".", "..") or not _SAFE_ID_RE.match(value) or ".." in value:
         raise WorktreeError(f"Invalid {label}: {value!r}")
     return value
 
@@ -204,14 +204,14 @@ class WorktreeManager:
                 if assignment_id in values:
                     return sha.strip()
 
-        # Fallback grep if trailer appeared above another paragraph
+        # Fallback grep if trailer appeared above another paragraph (exact line match)
         grep_args = [
             "log",
             rev_arg,
             "-n",
             "100",
-            "--fixed-strings",
-            f"--grep=Thread-Assignment-Id: {assignment_id}",
+            "--extended-regexp",
+            f"--grep=^Thread-Assignment-Id:[[:space:]]*{re.escape(assignment_id)}[[:space:]]*$",
             "--format=%H",
         ]
         grep_proc = _run_git(grep_args, cwd, check=False)

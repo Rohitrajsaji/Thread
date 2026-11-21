@@ -29,7 +29,18 @@ class EventLogger:
             scrubbed_dict = redactor.redact_payload(payload)
             serialized = json.dumps(scrubbed_dict, ensure_ascii=False)
         else:
-            serialized = redactor.redact_json(str(payload))
+            raw_str = str(payload)
+            is_json_container = False
+            try:
+                parsed = json.loads(raw_str)
+                is_json_container = isinstance(parsed, (dict, list))
+            except (json.JSONDecodeError, TypeError):
+                is_json_container = False
+            if is_json_container:
+                serialized = redactor.redact_json(raw_str)
+            else:
+                scrubbed_msg = redactor.redact_text(raw_str)
+                serialized = json.dumps({"message": scrubbed_msg}, ensure_ascii=False)
 
         # Mandatory pre-insert text scrubbing invariant
         safe_payload_json = redactor.redact_text(serialized)

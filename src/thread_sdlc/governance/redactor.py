@@ -22,11 +22,14 @@ _GITHUB_PAT_RE = re.compile(r"\bgithub_pat_[A-Za-z0-9_]{12,}\b")
 
 _AWS_ACCESS_KEY_RE = re.compile(r"\b(?:AKIA|ASIA|AROA|AIDA|ANPA|ANVA|APKA)[A-Z0-9]{16}\b")
 _AWS_SECRET_KEY_RE = re.compile(
-    r"(?i)((?:aws_secret_access_key|secret_access_key|SecretAccessKey)\s*[:=]\s*[\"']?)[A-Za-z0-9/+=]{32,}([\"']?)"
+    r"""(?i)((?:\\?["'])?(?:aws_secret_access_key|secret_access_key|SecretAccessKey)(?:\\?["'])?\s*[:=]\s*(?:\\?["'])?)[A-Za-z0-9/+=]{32,}((?:\\?["'])?)"""
 )
 
 _GCP_API_KEY_RE = re.compile(r"\bAIza[0-9A-Za-z\-_]{16,}\b")
-_GCP_SA_JSON_KEY_RE = re.compile(r'(?i)("private_key(?:_id)?"\s*:\s*")([^"]+)(")')
+_GCP_SA_JSON_KEY_RE = re.compile(r'(?i)("private_key(?:_id)?"\s*:\s*")((?:[^"\\]|\\.)+)(")')
+_GCP_SA_JSON_ESCAPED_KEY_RE = re.compile(
+    r'(?i)(\\"private_key(?:_id)?\\"\s*:\s*\\")((?:(?!\\")[^\n])+)(\\")'
+)
 
 _AUTH_BEARER_HEADER_RE = re.compile(
     r"(?i)(authorization\s*[:=]\s*bearer\s+)([^\s\"'`,;}{\\]+)"
@@ -38,11 +41,17 @@ _STANDALONE_BEARER_RE = re.compile(
 _URL_CREDENTIALS_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://[^:/@\s]+:)([^@/\s]+)(@)")
 
 _ENV_SECRET_KV_RE = re.compile(
-    r"""(?im)(^|[\s;|&])((?:export\s+)?[A-Za-z_][A-Za-z0-9_]*(?:_SECRET|_TOKEN|_KEY|_PASSWORD|_PASSWD|_PWD|_CREDENTIAL|_CREDENTIALS)|(?:export\s+)?(?:SECRET|TOKEN|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY|ACCESS_KEY|AUTH_TOKEN|CLIENT_SECRET|BEARER_TOKEN))\s*=\s*(?:"([^"\n]*)"|'([^'\n]*)'|([^\s"'`\\#;\n]+))"""
+    r"""(?im)(^|[\s;|&"'{\[,:])((?:export\s+)?[A-Za-z_][A-Za-z0-9_]*(?:_SECRET|_TOKEN|_KEY|_PASSWORD|_PASSWD|_PWD|_CREDENTIAL|_CREDENTIALS)|(?:export\s+)?(?:SECRET|TOKEN|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY|ACCESS_KEY|AUTH_TOKEN|CLIENT_SECRET|BEARER_TOKEN))\s*=\s*(?:"((?:[^"\\\n]|\\.)*)"|'([^'\n]*)'|([^\s"'`\\;\n]+))"""
 )
 
 _SENSITIVE_DICT_KEY_RE = re.compile(
-    r"(?i)^(?:.*_)?(?:secret|token|password|passwd|pwd|api_key|private_key|access_key|secret_key|auth_token|bearer_token|client_secret|authorization|private_key_id)$"
+    r"^(?:"
+    r"(?i:.*(?:secret|password|passwd|authorization))"
+    r"|(?i:(?:.*_)?(?:pwd|token|private_key_id|credentials?))"
+    r"|(?i:(?:.*_)?(?:api|private|access|auth|signing|encryption)_?key(?:_id)?)"
+    r"|.*[a-z](?:Token|Pwd)"
+    r"|.*(?:Api|Private|Access|Secret|Auth|Signing|Encryption)Key(?:Id)?"
+    r")$"
 )
 
 
@@ -71,6 +80,7 @@ def redact_text(text: str) -> str:
     scrubbed = _PEM_BLOCK_RE.sub(REDACTED, scrubbed)
     scrubbed = _PEM_TRUNCATED_RE.sub(REDACTED, scrubbed)
     scrubbed = _GCP_SA_JSON_KEY_RE.sub(rf"\1{REDACTED}\3", scrubbed)
+    scrubbed = _GCP_SA_JSON_ESCAPED_KEY_RE.sub(rf"\1{REDACTED}\3", scrubbed)
     scrubbed = _GITHUB_CLASSIC_TOKEN_RE.sub(REDACTED, scrubbed)
     scrubbed = _GITHUB_PAT_RE.sub(REDACTED, scrubbed)
     scrubbed = _AWS_ACCESS_KEY_RE.sub(REDACTED, scrubbed)
@@ -91,6 +101,17 @@ def redact_line(line: str) -> str:
 def redact_payload(data: Any) -> Any:
     """Recursively scrub secrets from structured dict/list/tuple payloads."""
     if isinstance(data, str):
+        stripped = data.strip()
+        if (stripped.startswith("{") and stripped.endswith("}")) or (
+            stripped.startswith("[") and stripped.endswith("]")
+        ):
+            try:
+                parsed = json.loads(data)
+            except (json.JSONDecodeError, TypeError):
+                return redact_text(data)
+            if isinstance(parsed, (dict, list)):
+                scrubbed_obj = redact_payload(parsed)
+                return redact_text(json.dumps(scrubbed_obj, ensure_ascii=False))
         return redact_text(data)
     if isinstance(data, list):
         return [redact_payload(item) for item in data]
