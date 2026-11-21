@@ -8,7 +8,7 @@ import importlib.util
 import os
 import shutil
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from pathlib import Path
 from typing import Any, Literal
 
@@ -265,6 +265,28 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
             return {"kind": "approved"}
         return {"kind": "denied-by-rules", "rules": [reason]}
 
+    def _resolve_request_cwd(self, request: Any, label: str) -> tuple[str | None, Path]:
+        """Extract and validate _SHELL_CWD_KEYS on SDK permission requests (dict or object)."""
+        if isinstance(request, Mapping):
+            cwd_str, resolved_cwd, _ = self._policy._extract_and_validate_cwds(
+                request, label
+            )
+            return cwd_str, resolved_cwd
+
+        cwd_candidates: dict[str, Any] = {}
+        for cwd_key in _SHELL_CWD_KEYS:
+            if hasattr(request, cwd_key):
+                val = getattr(request, cwd_key)
+                if val is not None:
+                    cwd_candidates[cwd_key] = val
+        if not cwd_candidates:
+            return None, self._policy.worktree_root
+        cwd_str = self._policy._validate_shell_cwd_mapping(cwd_candidates, label)
+        if cwd_str is None:
+            return None, self._policy.worktree_root
+        resolved_cwd, _ = self._policy._resolve_shell_cwd(cwd_str, label)
+        return cwd_str, resolved_cwd
+
     async def _on_permission_request(
         self, request: Any, invocation: Any = None
     ) -> Any:
@@ -280,6 +302,10 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
         else:
             op = "tool"
         try:
+            req_resolved_cwd = self._policy.worktree_root
+            if kind in ("write", "read", "path"):
+                _, req_resolved_cwd = self._resolve_request_cwd(request, op)
+
             # Hoist sandbox bypass / permissive / path-grant checks across ALL permission kinds
             if _extract_attr_or_key(request, "request_sandbox_bypass", "requestSandboxBypass"):
                 raise ScopeViolationError(
@@ -316,9 +342,17 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
                     .lower()
                 )
                 if grant_access == "read":
-                    self._policy.enforce_read(grant_path.strip())
+                    self._policy.enforce_read(grant_path.strip(), base_dir=req_resolved_cwd)
+                    if req_resolved_cwd != self._policy.worktree_root:
+                        self._policy.enforce_read(
+                            grant_path.strip(), base_dir=self._policy.worktree_root
+                        )
                 else:
-                    self._policy.enforce_write(grant_path.strip())
+                    self._policy.enforce_write(grant_path.strip(), base_dir=req_resolved_cwd)
+                    if req_resolved_cwd != self._policy.worktree_root:
+                        self._policy.enforce_write(
+                            grant_path.strip(), base_dir=self._policy.worktree_root
+                        )
 
             if kind == "write":
                 targets: list[str] = []
@@ -373,7 +407,9 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
                         "Write permission request missing target path (fail closed)",
                     )
                 for target in targets:
-                    self._policy.enforce_write(target)
+                    self._policy.enforce_write(target, base_dir=req_resolved_cwd)
+                    if req_resolved_cwd != self._policy.worktree_root:
+                        self._policy.enforce_write(target, base_dir=self._policy.worktree_root)
             elif kind in ("shell", "commands"):
                 possible_urls_raw = _extract_attr_or_key(
                     request, "possible_urls", "possibleUrls"
@@ -471,7 +507,9 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
                         "Read permission request missing target path (fail closed)",
                     )
                 for target in read_targets:
-                    self._policy.enforce_read(target)
+                    self._policy.enforce_read(target, base_dir=req_resolved_cwd)
+                    if req_resolved_cwd != self._policy.worktree_root:
+                        self._policy.enforce_read(target, base_dir=self._policy.worktree_root)
             elif kind == "path":
                 access_raw = _extract_attr_or_key(request, "access_kind", "accessKind")
                 access_kind = str(getattr(access_raw, "value", access_raw) or "").strip().lower()
@@ -481,7 +519,11 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
                 if isinstance(ro_dirs, (list, tuple)):
                     for ro_dir in ro_dirs:
                         if isinstance(ro_dir, str) and ro_dir.strip():
-                            self._policy.enforce_read(ro_dir.strip())
+                            self._policy.enforce_read(ro_dir.strip(), base_dir=req_resolved_cwd)
+                            if req_resolved_cwd != self._policy.worktree_root:
+                                self._policy.enforce_read(
+                                    ro_dir.strip(), base_dir=self._policy.worktree_root
+                                )
                 paths_raw = _extract_attr_or_key(request, "paths", "path")
                 path_list: list[str]
                 if isinstance(paths_raw, str):
@@ -508,10 +550,14 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
                     )
                 if access_kind in ("write", "create", "delete", "modify"):
                     for target in path_list:
-                        self._policy.enforce_write(target)
+                        self._policy.enforce_write(target, base_dir=req_resolved_cwd)
+                        if req_resolved_cwd != self._policy.worktree_root:
+                            self._policy.enforce_write(target, base_dir=self._policy.worktree_root)
                 elif access_kind == "read":
                     for target in path_list:
-                        self._policy.enforce_read(target)
+                        self._policy.enforce_read(target, base_dir=req_resolved_cwd)
+                        if req_resolved_cwd != self._policy.worktree_root:
+                            self._policy.enforce_read(target, base_dir=self._policy.worktree_root)
                 else:
                     raise ScopeViolationError(
                         self._policy.role,

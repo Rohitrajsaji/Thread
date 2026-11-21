@@ -62,9 +62,11 @@ _SHELL_TOOLS = frozenset(
         "bash",
         "shell",
         "run_command",
+        "run_cmd",
         "execute",
         "terminal",
         "powershell",
+        "pwsh",
         "cmd",
         "sh",
         "zsh",
@@ -322,7 +324,18 @@ _ALLOWED_PYTHON_MODULES = frozenset(
     {"pytest", "unittest", "py_compile", "compileall", "ruff", "mypy", "coverage"}
 )
 
-_SHELL_CMD_KEYS = ("command", "cmd", "script", "CommandLine", "full_command_text")
+_SHELL_CMD_KEYS = (
+    "command",
+    "cmd",
+    "script",
+    "command_line",
+    "commandLine",
+    "CommandLine",
+    "full_command_text",
+    "fullCommandText",
+    "shell_command",
+    "shellCommand",
+)
 _SHELL_CWD_KEYS = (
     "cwd",
     "working_directory",
@@ -1506,9 +1519,6 @@ class RolePolicy:
                     _, bundled_p = _parse_bundled_pytest_p(tok)
                     if bundled_p is None:
                         expect_pytest_flag_val = True
-                        expect_pytest_p = True
-                    elif bundled_p == "no:cacheprovider":
-                        has_no_cacheprovider = True
                 elif tok in _PYTEST_VALUE_LONG_FLAGS or _pytest_short_flag_expects_next_value(tok):
                     expect_pytest_flag_val = True
 
@@ -2443,6 +2453,79 @@ class RolePolicy:
         _walk(args)
         return extracted
 
+    def _extract_and_validate_cwds(
+        self, args: Any, label: str
+    ) -> tuple[str | None, Path, list[Path]]:
+        """Recursively scan nested dicts/lists for _SHELL_CWD_KEYS and validate containment."""
+        found: list[tuple[str, Path]] = []
+
+        def _walk(node: Any) -> None:
+            if isinstance(node, Mapping):
+                has_cwd = any(k in node and node[k] is not None for k in _SHELL_CWD_KEYS)
+                if has_cwd:
+                    cwd_val = self._validate_shell_cwd_mapping(dict(node), label)
+                    if cwd_val is not None:
+                        resolved, _ = self._resolve_shell_cwd(cwd_val, label)
+                        found.append((cwd_val, resolved))
+                for val in node.values():
+                    if isinstance(val, (Mapping, list, tuple)):
+                        _walk(val)
+            elif isinstance(node, (list, tuple)):
+                for item in node:
+                    if isinstance(item, (Mapping, list, tuple)):
+                        _walk(item)
+
+        _walk(args)
+        if not found:
+            return None, self.worktree_root, [self.worktree_root]
+
+        first_resolved = found[0][1]
+        for _, resolved in found[1:]:
+            if resolved != first_resolved:
+                raise ScopeViolationError(
+                    self.role,
+                    "shell",
+                    label,
+                    "Conflicting working directory values across tool arguments",
+                )
+
+        chosen_raw = found[0][0]
+        for raw_val, resolved in found:
+            lex_paths = self._compute_lexical_paths(raw_val)
+            if any(lp != resolved for lp in lex_paths):
+                chosen_raw = raw_val
+                break
+        resolved_cwd, _ = self._resolve_shell_cwd(chosen_raw, label)
+        return chosen_raw, resolved_cwd, [resolved_cwd]
+
+    def _extract_shell_command_values(self, args: Any, tool_name: str) -> list[str]:
+        """Recursively collect and fail-closed validate all present non-None _SHELL_CMD_KEYS."""
+        commands: list[str] = []
+
+        def _walk(node: Any) -> None:
+            if isinstance(node, Mapping):
+                for key in _SHELL_CMD_KEYS:
+                    if key in node and node[key] is not None:
+                        val = node[key]
+                        if not isinstance(val, str) or not val.strip():
+                            raise ScopeViolationError(
+                                self.role,
+                                "tool",
+                                tool_name,
+                                f"Invalid or empty shell command argument {key!r} (fail closed)",
+                            )
+                        commands.append(val)
+                for val in node.values():
+                    if isinstance(val, (Mapping, list, tuple)):
+                        _walk(val)
+            elif isinstance(node, (list, tuple)):
+                for item in node:
+                    if isinstance(item, (Mapping, list, tuple)):
+                        _walk(item)
+
+        _walk(args)
+        return commands
+
     def enforce_tool_call(
         self, tool_name: str, tool_args: dict[str, Any] | str | None
     ) -> None:
@@ -2459,42 +2542,64 @@ class RolePolicy:
         if tool_args is None:
             args = {}
         elif isinstance(tool_args, str):
+            stripped_args = tool_args.strip()
             try:
                 parsed = json.loads(tool_args)
-                args = parsed if isinstance(parsed, dict) else {"raw": tool_args}
             except json.JSONDecodeError:
+                if stripped_args.startswith(("{", "[")):
+                    raise ScopeViolationError(
+                        self.role,
+                        "tool",
+                        tool_name,
+                        "Malformed JSON toolArgs payload (fail closed)",
+                    )
                 args = {"raw": tool_args}
+            else:
+                if isinstance(parsed, dict):
+                    args = parsed
+                elif isinstance(parsed, str):
+                    args = {"raw": parsed}
+                else:
+                    raise ScopeViolationError(
+                        self.role,
+                        "tool",
+                        tool_name,
+                        "Malformed JSON toolArgs payload (fail closed)",
+                    )
         elif isinstance(tool_args, Mapping):
             args = dict(tool_args)
         else:
-            args = {}
+            raise ScopeViolationError(
+                self.role,
+                "tool",
+                tool_name,
+                f"Malformed toolArgs type {type(tool_args).__name__} (fail closed)",
+            )
+
+        if any(k in norm_name for k in ("merge", "push")):
+            raise ScopeViolationError(
+                self.role, "tool", tool_name, "Workers are forbidden from merging or pushing"
+            )
 
         if norm_name in _SHELL_TOOLS or any(k in norm_name for k in ("bash", "shell", "exec")):
-            cmd_val: str | None = None
-            for key in _SHELL_CMD_KEYS:
-                val = args.get(key)
-                if isinstance(val, str) and val.strip():
-                    cmd_val = val
-                    break
-            if cmd_val is None and isinstance(args.get("raw"), str):
-                cmd_val = args["raw"]
-            if not cmd_val:
+            cwd_val, _, _ = self._extract_and_validate_cwds(args, tool_name)
+            cmd_values = self._extract_shell_command_values(args, tool_name)
+            if not cmd_values:
+                raw_val = args.get("raw")
+                if isinstance(raw_val, str) and raw_val.strip():
+                    cmd_values = [raw_val]
+            if not cmd_values:
                 raise ScopeViolationError(
                     self.role,
                     "tool",
                     tool_name,
                     "Shell tool call missing command argument (fail closed)",
                 )
-            cwd_val = self._validate_shell_cwd_mapping(args, cmd_val)
-            self.enforce_shell(cmd_val, cwd=cwd_val)
+            for cmd_val in cmd_values:
+                self.enforce_shell(cmd_val, cwd=cwd_val)
             return
 
-        non_shell_cwd = self._validate_shell_cwd_mapping(args, tool_name)
-        resolved_cwd = (
-            self._resolve_shell_cwd(non_shell_cwd, tool_name)[0]
-            if non_shell_cwd is not None
-            else self.worktree_root
-        )
+        non_shell_cwd, _, resolved_cwds = self._extract_and_validate_cwds(args, tool_name)
 
         if norm_name in _WRITE_TOOLS or (
             norm_name not in _READ_TOOLS
@@ -2526,8 +2631,9 @@ class RolePolicy:
                     "Write/edit tool call missing extractable target path (fail closed)",
                 )
             for target in extracted:
-                self.enforce_write(target, base_dir=resolved_cwd)
-                if resolved_cwd != self.worktree_root:
+                for base_dir in resolved_cwds:
+                    self.enforce_write(target, base_dir=base_dir)
+                if self.worktree_root not in resolved_cwds:
                     self.enforce_write(target, base_dir=self.worktree_root)
             return
 
@@ -2535,15 +2641,11 @@ class RolePolicy:
             for target in self._extract_tool_paths(
                 args, include_patches=False, extra_keys=_READ_EXTRA_PATH_KEYS
             ):
-                self.enforce_read(target, base_dir=resolved_cwd)
-                if resolved_cwd != self.worktree_root:
+                for base_dir in resolved_cwds:
+                    self.enforce_read(target, base_dir=base_dir)
+                if self.worktree_root not in resolved_cwds:
                     self.enforce_read(target, base_dir=self.worktree_root)
             return
-
-        if norm_name in ("git_merge", "git_push", "merge", "push"):
-            raise ScopeViolationError(
-                self.role, "tool", tool_name, "Workers are forbidden from merging or pushing"
-            )
 
         if self.readonly:
             raise ScopeViolationError(
@@ -2553,17 +2655,21 @@ class RolePolicy:
                 f"Read-only role cannot invoke unrecognized or mutating tool {tool_name!r}",
             )
 
-        # Unrecognized tools carrying path args must be write-checked (fail closed),
-        # while read/search directory keys must still satisfy worktree read containment.
+        # Unrecognized tools carrying shell command keys or path args must be strictly validated.
+        for cmd_val in self._extract_shell_command_values(args, tool_name):
+            self.enforce_shell(cmd_val, cwd=non_shell_cwd)
+
         for target in self._extract_tool_paths(args):
-            self.enforce_write(target, base_dir=resolved_cwd)
-            if resolved_cwd != self.worktree_root:
+            for base_dir in resolved_cwds:
+                self.enforce_write(target, base_dir=base_dir)
+            if self.worktree_root not in resolved_cwds:
                 self.enforce_write(target, base_dir=self.worktree_root)
         for target in self._extract_tool_paths(
             args, include_patches=False, extra_keys=_READ_EXTRA_PATH_KEYS
         ):
-            self.enforce_read(target, base_dir=resolved_cwd)
-            if resolved_cwd != self.worktree_root:
+            for base_dir in resolved_cwds:
+                self.enforce_read(target, base_dir=base_dir)
+            if self.worktree_root not in resolved_cwds:
                 self.enforce_read(target, base_dir=self.worktree_root)
 
     def enforce_hook_payload(self, payload: Any) -> str:
@@ -2642,6 +2748,13 @@ class RolePolicy:
                 try:
                     parsed = json.loads(raw_val)
                 except json.JSONDecodeError:
+                    if raw_val.strip().startswith(("{", "[")):
+                        raise ScopeViolationError(
+                            self.role,
+                            "tool",
+                            tool_name,
+                            f"Malformed JSON {key_name} payload (fail closed)",
+                        )
                     return {"raw": raw_val}
                 if isinstance(parsed, dict):
                     return dict(parsed)

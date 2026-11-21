@@ -46,9 +46,9 @@ _ENV_SECRET_KV_RE = re.compile(
 
 _SENSITIVE_DICT_KEY_RE = re.compile(
     r"^(?:"
-    r"(?i:.*(?:secret|password|passwd|authorization))"
-    r"|(?i:(?:.*_)?(?:pwd|token|private_key_id|credentials?))"
-    r"|(?i:(?:.*_)?(?:api|private|access|auth|signing|encryption)_?key(?:_id)?)"
+    r"(?i:.*(?:secret|password|passwd|authorization|bearer))"
+    r"|(?i:(?:.*[-_])?(?:pwd|token|private[-_]key[-_]id|credentials?))"
+    r"|(?i:(?:.*[-_])?(?:api|private|access|auth|signing|encryption)[-_]?key(?:[-_]id)?)"
     r"|.*[a-z](?:Token|Pwd)"
     r"|.*(?:Api|Private|Access|Secret|Auth|Signing|Encryption)Key(?:Id)?"
     r")$"
@@ -170,15 +170,27 @@ class StreamRedactor:
 
         if self._in_pem_block:
             self._pem_lines_seen += 1
-            if _PEM_END_LINE_RE.search(line) or self._pem_lines_seen >= self._max_pem_lines:
+            end_matches = list(_PEM_END_LINE_RE.finditer(line))
+            if end_matches:
+                last_end = end_matches[-1].end()
+                if _PEM_START_LINE_RE.search(line[last_end:]):
+                    self._in_pem_block = True
+                    self._pem_lines_seen = 1
+                    return f"{REDACTED}{suffix}"
+                self._in_pem_block = False
+                self._pem_lines_seen = 0
+            elif self._pem_lines_seen >= self._max_pem_lines:
                 self._in_pem_block = False
                 self._pem_lines_seen = 0
             return f"{REDACTED}{suffix}"
 
-        if _PEM_START_LINE_RE.search(line) and not _PEM_END_LINE_RE.search(line):
-            self._in_pem_block = True
-            self._pem_lines_seen = 1
-            return f"{REDACTED}{suffix}"
+        start_matches = list(_PEM_START_LINE_RE.finditer(line))
+        if start_matches:
+            end_matches = list(_PEM_END_LINE_RE.finditer(line))
+            if not end_matches or start_matches[-1].start() >= end_matches[-1].end():
+                self._in_pem_block = True
+                self._pem_lines_seen = 1
+                return f"{REDACTED}{suffix}"
 
         return redact_text(line)
 
