@@ -565,3 +565,86 @@ def test_concurrent_dispatch_ticket_enforces_max_workers_atomically_and_cleans_u
     # TM4 must dispatch cleanly without WorkerConcurrencyError
     res_tm4 = asyncio.run(mgr.dispatch_ticket("thr-mt", "TM4", "succeed after setup fail"))
     assert res_tm4.status == "completed"
+
+
+def test_same_ticket_concurrent_dispatch_and_cross_thread_ticket_rejected(
+    tmp_path: Path,
+) -> None:
+    """Even with max_workers_per_thread >= 2, same-ticket concurrent dispatch and cross-thread dispatch fail closed."""
+    import threading
+
+    from thread_sdlc.workers import WorkerConcurrencyError
+
+    repo, base_sha = _setup_repo(tmp_path)
+    db = StateDatabase(repo_root=repo)
+    sr = StateRepository(db)
+    sr.create_thread(ThreadRecord(id="thr-a", title="Thread A", base_sha=base_sha))
+    sr.create_thread(ThreadRecord(id="thr-b", title="Thread B", base_sha=base_sha))
+    sr.create_ticket(TicketRecord(id="TA1", thread_id="thr-a", title="TA1", role="backend"))
+    sr.create_ticket(TicketRecord(id="TB1", thread_id="thr-b", title="TB1", role="backend"))
+
+    policy = PolicyConfig()
+    policy.caps.max_workers_per_thread = 2
+
+    started_lock = threading.Lock()
+    started_count = 0
+
+    class _SlowSuccessAdapter(MockWorkerAdapter):
+        async def start(self, assignment: Any) -> None:
+            nonlocal started_count
+            with started_lock:
+                started_count += 1
+            await asyncio.sleep(0.15)
+            await super().start(assignment)
+
+    mgr = WorkerManager(
+        repo_root=repo,
+        db=db,
+        policy=policy,
+        scope=ScopeConfig(),
+        adapter_factory=lambda pol: _SlowSuccessAdapter(pol, scenario="commit_success"),
+    )
+
+    # 1. Cross-thread ticket dispatch must be rejected before worktree/worker invocation
+    with pytest.raises(ValueError, match="belongs to thread"):
+        asyncio.run(mgr.dispatch_ticket("thr-a", "TB1", "cross thread"))
+    assert sr.count_active_assignments("thr-a") == 0
+    assert sr.count_active_assignments("thr-b") == 0
+    assert started_count == 0
+
+    # 2. Two concurrent OS threads dispatching the SAME ticket with max_workers_per_thread=2
+    barrier = threading.Barrier(2)
+    results: list[tuple[str, Any]] = []
+    res_lock = threading.Lock()
+
+    def _run_same_ticket() -> None:
+        barrier.wait(timeout=5.0)
+        try:
+            res = asyncio.run(mgr.dispatch_ticket("thr-a", "TA1", "work"))
+            with res_lock:
+                results.append(("ok", res))
+        except Exception as exc:
+            with res_lock:
+                results.append(("err", exc))
+
+    t1 = threading.Thread(target=_run_same_ticket)
+    t2 = threading.Thread(target=_run_same_ticket)
+    t1.start()
+    t2.start()
+    t1.join(timeout=15.0)
+    t2.join(timeout=15.0)
+
+    assert len(results) == 2
+    ok_items = [item for kind, item in results if kind == "ok"]
+    err_items = [item for kind, item in results if kind == "err"]
+    assert len(ok_items) == 1, f"Expected 1 completed dispatch, got {results!r}"
+    assert len(err_items) == 1 and isinstance(err_items[0], WorkerConcurrencyError), (
+        f"Expected 1 WorkerConcurrencyError, got {results!r}"
+    )
+    assert ok_items[0].status == "completed"
+    assert ok_items[0].result_sha is not None
+    assert started_count == 1
+    assert sr.count_active_assignments("thr-a") == 0
+    final_ticket = sr.get_ticket("TA1")
+    assert final_ticket is not None and final_ticket.status == "done"
+    assert final_ticket.result_sha == ok_items[0].result_sha

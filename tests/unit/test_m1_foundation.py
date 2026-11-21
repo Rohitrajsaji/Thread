@@ -3425,3 +3425,316 @@ def test_sdk_pre_tool_use_and_cli_stream_enforce_top_level_working_directory(
         )
     )
     assert ok_dec["permissionDecision"] == "allow"
+
+
+# ---------------------------------------------------------------------------
+# 21. Iteration 11 Regression Tests (R10 Challenger 1 & 2 Findings)
+# ---------------------------------------------------------------------------
+
+
+def test_non_shell_tools_enforce_working_directory_base_dir_and_symlinks(tmp_path: Path) -> None:
+    """Verify non-shell tools validate workingDirectory/cwd as base_dir across CLI, SDK, and stream_events."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret_file = outside / "secret.txt"
+    secret_file.write_text("TOP_SECRET", encoding="utf-8")
+
+    wt = tmp_path / "wt"
+    (wt / "app" / "app").mkdir(parents=True)
+    (wt / "tests").mkdir(parents=True)
+    (wt / "app" / "ok.py").write_text("x = 1\n", encoding="utf-8")
+    (wt / "app" / "leak_link").symlink_to(secret_file)
+    (wt / "app" / "app" / "link_out").symlink_to(outside / "pwn.txt")
+
+    be = RolePolicy(
+        role="backend",
+        worktree_root=wt,
+        allowed_paths=["app/**"],
+        denied_paths=[".thread/**"],
+        allowed_shell_prefixes=["pytest"],
+    )
+    ver = RolePolicy(
+        role="verifier",
+        worktree_root=wt,
+        allowed_paths=["tests/**"],
+        denied_paths=[".thread/**"],
+        allowed_shell_prefixes=["pytest"],
+    )
+    sdk_be = CopilotSdkAdapter(be)
+    sdk_ver = CopilotSdkAdapter(ver)
+
+    # 1. backend writing relative app/pwn.py with workingDirectory=tests resolves to tests/app/pwn.py -> denied
+    write_bypass_payload = {
+        "sessionId": "s1",
+        "workingDirectory": str(wt / "tests"),
+        "toolName": "write_file",
+        "toolArgs": {"path": "app/pwn.py", "content": "pwn"},
+    }
+    with pytest.raises(ScopeViolationError):
+        be.enforce_hook_payload(write_bypass_payload)
+    with pytest.raises(ScopeViolationError):
+        be.enforce_tool_call("write_file", {"path": "app/pwn.py", "workingDirectory": str(wt / "tests")})
+
+    # Also test dual-resolution protection: workingDirectory=app + relative path "pwn.py" (outside app/** if resolved at root)
+    with pytest.raises(ScopeViolationError):
+        be.enforce_tool_call("write_file", {"path": "pwn.py", "workingDirectory": "app"})
+
+    # 2. Escaping symlink write under workingDirectory=app
+    write_symlink_payload = {
+        "sessionId": "s1",
+        "workingDirectory": "app",
+        "toolName": "write_file",
+        "toolArgs": {"path": "app/link_out", "content": "pwn"},
+    }
+    with pytest.raises(ScopeViolationError):
+        be.enforce_hook_payload(write_symlink_payload)
+
+    # 3. Unrecognized tool carrying path + workingDirectory=tests
+    unrec_payload = {
+        "sessionId": "s1",
+        "workingDirectory": str(wt / "tests"),
+        "toolName": "custom_opaque_writer",
+        "toolArgs": {"path": "app/pwn.py"},
+    }
+    with pytest.raises(ScopeViolationError):
+        be.enforce_hook_payload(unrec_payload)
+
+    # 4. Escaping symlink read under workingDirectory=app
+    read_symlink_payload = {
+        "sessionId": "s1",
+        "workingDirectory": str(wt / "app"),
+        "toolName": "read_file",
+        "toolArgs": {"path": "leak_link"},
+    }
+    with pytest.raises(ScopeViolationError):
+        ver.enforce_hook_payload(read_symlink_payload)
+
+    # 5. Enforce across CLI preToolUse, SDK _on_pre_tool_use, SDK _on_permission_request, and CLI stream_events
+    for pol, sdk, payload in (
+        (be, sdk_be, write_bypass_payload),
+        (be, sdk_be, write_symlink_payload),
+        (be, sdk_be, unrec_payload),
+        (ver, sdk_ver, read_symlink_payload),
+    ):
+        hook_proc = subprocess.run(
+            [sys.executable, "-m", "thread_sdlc.workers.permissions"],
+            input=json.dumps(payload),
+            env={**os.environ, "THREAD_POLICY_JSON": json.dumps(pol.to_dict())},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert json.loads(hook_proc.stdout)["permissionDecision"] == "deny"
+
+        sdk_pre = asyncio.run(sdk._on_pre_tool_use(payload))
+        assert sdk_pre["permissionDecision"] == "deny"
+
+        for kind in ("hook", "custom-tool", "mcp"):
+            perm_dec = asyncio.run(sdk._on_permission_request({"kind": kind, **payload}))
+            assert perm_dec["kind"] == "denied-by-rules"
+
+        cli_line = json.dumps({"type": "pre_tool_use", **payload})
+        cli_ad = CopilotCliSubprocessAdapter(
+            pol,
+            command_builder=lambda _a, _cfg, line=cli_line: [
+                sys.executable,
+                "-c",
+                f"print({line!r})",
+            ],
+        )
+        asgn = WorkerAssignment(
+            assignment_id="a-wd-non-shell",
+            thread_id="t-1",
+            ticket_id="T1",
+            role=pol.role,
+            instructions="test",
+            worktree_path=wt,
+            base_sha="HEAD",
+        )
+
+        async def _run_cli() -> None:
+            await cli_ad.start(asgn)
+            try:
+                async for _ in cli_ad.stream_events():
+                    pass
+            finally:
+                await cli_ad.disconnect()
+
+        with pytest.raises(ScopeViolationError):
+            asyncio.run(_run_cli())
+
+    # 6. Legitimate absolute in-scope write with workingDirectory=app passes
+    assert be.enforce_hook_payload(
+        {
+            "toolName": "write_file",
+            "workingDirectory": str(wt / "app"),
+            "toolArgs": {"path": str(wt / "app" / "ok.py"), "content": "x = 2\n"},
+        }
+    ) == "write_file"
+
+
+def test_empty_or_missing_tool_name_and_conflicting_hook_aliases_fail_closed(tmp_path: Path) -> None:
+    """Verify empty/missing toolName and conflicting toolName/tool_name or toolArgs/args aliases fail closed."""
+    wt = tmp_path / "wt"
+    (wt / "app").mkdir(parents=True)
+    (wt / "app" / "mod.py").write_text("x = 1\n", encoding="utf-8")
+
+    be = RolePolicy(
+        role="backend",
+        worktree_root=wt,
+        allowed_paths=["app/**"],
+        denied_paths=[".thread/**"],
+        allowed_shell_prefixes=["pytest"],
+    )
+    ver = RolePolicy(
+        role="verifier",
+        worktree_root=wt,
+        allowed_paths=["tests/**"],
+        denied_paths=[".thread/**"],
+        allowed_shell_prefixes=["pytest"],
+    )
+    sdk_be = CopilotSdkAdapter(be)
+
+    # 1. Empty or missing toolName must fail closed across enforce_tool_call, enforce_hook_payload, SDK, CLI
+    for empty_name in ("", "   "):
+        with pytest.raises(ScopeViolationError):
+            be.enforce_tool_call(empty_name, {"command": "rm -rf /"})
+
+    for bad_payload in (
+        {"toolArgs": {"command": "rm -rf /"}},
+        {"toolName": "", "toolArgs": {"command": "rm -rf /"}},
+        {"toolName": "   ", "toolArgs": {"command": "rm -rf /"}},
+        {"tool_name": "", "toolArgs": {"command": "rm -rf /"}},
+        {"toolName": None, "tool_name": None, "toolArgs": {"command": "rm -rf /"}},
+    ):
+        with pytest.raises(ScopeViolationError):
+            be.enforce_hook_payload(bad_payload)
+        dec = asyncio.run(sdk_be._on_pre_tool_use(bad_payload))
+        assert dec["permissionDecision"] == "deny"
+
+        hook_proc = subprocess.run(
+            [sys.executable, "-m", "thread_sdlc.workers.permissions"],
+            input=json.dumps(bad_payload),
+            env={**os.environ, "THREAD_POLICY_JSON": json.dumps(be.to_dict())},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert json.loads(hook_proc.stdout)["permissionDecision"] == "deny"
+
+        cli_line = json.dumps({"type": "pre_tool_use", **bad_payload})
+        cli_ad = CopilotCliSubprocessAdapter(
+            be,
+            command_builder=lambda _a, _cfg, line=cli_line: [
+                sys.executable,
+                "-c",
+                f"print({line!r})",
+            ],
+        )
+        asgn = WorkerAssignment(
+            assignment_id="a-empty-tool",
+            thread_id="t-1",
+            ticket_id="T1",
+            role="backend",
+            instructions="test",
+            worktree_path=wt,
+            base_sha="HEAD",
+        )
+
+        async def _run_empty_cli() -> None:
+            await cli_ad.start(asgn)
+            try:
+                async for _ in cli_ad.stream_events():
+                    pass
+            finally:
+                await cli_ad.disconnect()
+
+        with pytest.raises(ScopeViolationError):
+            asyncio.run(_run_empty_cli())
+
+    # 2. Conflicting toolName/tool_name and toolArgs/args/arguments/input aliases fail closed
+    for conflict_payload in (
+        {"toolName": "read_file", "tool_name": "write_file", "toolArgs": {"path": "app/mod.py"}},
+        {"toolName": "read_file", "tool_name": "", "toolArgs": {"path": "app/mod.py"}},
+        {"toolName": "bash", "toolArgs": {"command": "pytest"}, "args": {"command": "rm -rf .thread"}},
+        {"toolName": "bash", "toolArgs": '{"command": "pytest"}', "arguments": {"command": "rm -rf .thread"}},
+        {"toolName": "read_file", "toolArgs": {"path": "app/mod.py"}, "input": {"path": ".thread/policy.yaml"}},
+    ):
+        with pytest.raises(ScopeViolationError):
+            ver.enforce_hook_payload(conflict_payload)
+
+    # 3. Agreeing aliases remain allowed
+    assert (
+        ver.enforce_hook_payload(
+            {
+                "toolName": "read_file",
+                "tool_name": "read_file",
+                "toolArgs": '{"path": "app/mod.py"}',
+                "args": {"path": "app/mod.py"},
+            }
+        )
+        == "read_file"
+    )
+
+
+def test_pytest_default_cache_dir_subdir_cwd_without_root_config_blocked(tmp_path: Path) -> None:
+    """Verify pytest without root config cannot write .pytest_cache into .thread or out-of-scope subdirs via cwd."""
+    wt = tmp_path / "wt"
+    (wt / ".thread").mkdir(parents=True)
+    (wt / ".thread" / "policy.yaml").write_text("base_branch: main\n", encoding="utf-8")
+    (wt / "app").mkdir(parents=True)
+    (wt / "tests").mkdir(parents=True)
+    (wt / "tests" / "test_ok.py").write_text("def test_ok(): pass\n", encoding="utf-8")
+
+    ver = RolePolicy(
+        role="verifier",
+        worktree_root=wt,
+        allowed_paths=["tests/**"],
+        denied_paths=[".thread/**"],
+        allowed_shell_prefixes=["pytest", "python"],
+    )
+    be = RolePolicy(
+        role="backend",
+        worktree_root=wt,
+        allowed_paths=["app/**", "tests/**"],
+        denied_paths=[".thread/**"],
+        allowed_shell_prefixes=["pytest", "python"],
+    )
+    ro = RolePolicy(
+        role="reviewer_readonly",
+        worktree_root=wt,
+        allowed_paths=[],
+        denied_paths=["**"],
+        allowed_shell_prefixes=["pytest", "python"],
+        readonly=True,
+    )
+
+    # Without root config, cwd=".thread" or out-of-scope "app" must be rejected when cacheprovider is enabled
+    for bad_cmd, bad_cwd, pol in (
+        ("pytest -q", ".thread", ver),
+        ("python -m pytest -q", ".thread", ver),
+        ("pytest -q", "app", ver),
+        ("pytest -q", ".thread", be),
+        ("pytest -q", ".thread", ro),
+        ("pytest -q", "app", ro),
+        ("pytest -q", "tests", ro),
+    ):
+        with pytest.raises(ScopeViolationError):
+            pol.enforce_shell(bad_cmd, cwd=bad_cwd)
+
+    # In-scope cwd="tests" for verifier, explicit -p no:cacheprovider, or --rootdir=. remain allowed
+    assert ver.enforce_shell("pytest -q", cwd="tests")
+    assert ver.enforce_shell("pytest -p no:cacheprovider -q", cwd=".thread")
+    assert ver.enforce_shell("pytest -pno:cacheprovider -q", cwd="app")
+    assert ver.enforce_shell("pytest --rootdir=.. -q", cwd="app")
+    assert ro.enforce_shell("pytest -p no:cacheprovider -q", cwd="tests")
+
+    # Root tox.ini without [pytest] does NOT anchor rootdir in pytest 9.2.0, so cwd="app" still fails
+    (wt / "tox.ini").write_text("[flake8]\nmax-line-length = 100\n", encoding="utf-8")
+    with pytest.raises(ScopeViolationError):
+        ver.enforce_shell("pytest -q", cwd="app")
+    (wt / "tox.ini").unlink()
+
+    # Root pyproject.toml DOES anchor rootdir to worktree_root
+    (wt / "pyproject.toml").write_text('[project]\nname = "demo"\n', encoding="utf-8")
+    assert ver.enforce_shell("pytest -q", cwd="app")

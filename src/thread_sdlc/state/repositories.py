@@ -426,12 +426,29 @@ class StateRepository:
             if ticket_row is None:
                 raise KeyError(f"Ticket {assignment.ticket_id!r} not found")
             ticket = _row_to_ticket(ticket_row)
+            if ticket.thread_id != thread_id:
+                raise ValueError(
+                    f"Ticket {assignment.ticket_id!r} belongs to thread {ticket.thread_id!r}, "
+                    f"not {thread_id!r}"
+                )
 
             if (
                 thread.status == "PausedQuota"
                 or thread.credits_used >= max_credits_per_thread
             ):
                 return thread, ticket, "paused_quota", {}
+
+            running_ticket_row = conn.execute(
+                "SELECT id FROM assignments WHERE ticket_id = ? AND status = 'running' LIMIT 1",
+                (assignment.ticket_id,),
+            ).fetchone()
+            if running_ticket_row is not None:
+                return (
+                    thread,
+                    ticket,
+                    "ticket_already_running",
+                    {"running_assignment_id": running_ticket_row["id"]},
+                )
 
             active_row = conn.execute(
                 """

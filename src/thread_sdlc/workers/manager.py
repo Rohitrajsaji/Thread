@@ -241,6 +241,10 @@ class WorkerManager:
         ticket = self.repo.get_ticket(ticket_id)
         if ticket is None:
             raise KeyError(f"Ticket {ticket_id!r} not found")
+        if ticket.thread_id != thread_id:
+            raise ValueError(
+                f"Ticket {ticket_id!r} belongs to thread {ticket.thread_id!r}, not {thread_id!r}"
+            )
 
         # Step 1: Pre-dispatch crash reconciliation (never invoke worker if already committed)
         rec = self.reconcile_ticket(thread_id, ticket_id, assignment_id=assignment_id)
@@ -281,6 +285,11 @@ class WorkerManager:
                 limit_type="credits",
                 credits_used=thread.credits_used,
                 turns_used=thread.turns_used,
+            )
+        if rejection == "ticket_already_running":
+            running_id = meta.get("running_assignment_id")
+            raise WorkerConcurrencyError(
+                f"Ticket {ticket_id!r} already has running assignment {running_id!r}"
             )
         if rejection == "concurrency_limit":
             active_workers = meta.get("active_workers", self.policy.caps.max_workers_per_thread)

@@ -485,6 +485,21 @@ def _parse_bundled_pytest_c(tok: str) -> tuple[bool, str | None, bool]:
     return False, None, False
 
 
+def _parse_bundled_pytest_p(tok: str) -> tuple[bool, str | None]:
+    """Inspect a short pytest option cluster like ``-qp`` or ``-qpno:cacheprovider``."""
+    if not tok.startswith("-") or tok.startswith("--") or len(tok) <= 2:
+        return False, None
+    chars = tok[1:]
+    value_stops = (_PYTEST_VALUE_SHORT_FLAGS - {"p"}) | {"o"}
+    for j, ch in enumerate(chars):
+        if ch in value_stops:
+            return False, None
+        if ch == "p":
+            rest = chars[j + 1 :]
+            return True, (rest if rest else None)
+    return False, None
+
+
 def _pytest_short_flag_expects_next_value(tok: str) -> bool:
     """Return True if a short pytest option cluster ends with a non-c/o value flag."""
     if not tok.startswith("-") or tok.startswith("--") or len(tok) < 2:
@@ -1392,7 +1407,11 @@ class RolePolicy:
         expect_pytest_ini = False
         expect_pytest_cfg = False
         expect_pytest_rootdir = False
+        expect_pytest_p = False
         has_explicit_pytest_cfg = False
+        has_explicit_pytest_cache_dir = False
+        has_explicit_pytest_rootdir = False
+        has_no_cacheprovider = False
         pytest_positional_args: list[str] = []
         expect_pytest_flag_val = False
         pytest_after_double_dash = False
@@ -1433,13 +1452,14 @@ class RolePolicy:
 
             if expect_pytest_ini:
                 expect_pytest_ini = False
-                self._check_pytest_override_ini(
+                if self._check_pytest_override_ini(
                     tok,
                     command,
                     in_pytest_addopts=in_pytest_addopts,
                     effective_cwd=effective_cwd,
                     lexical_cwds=lexical_cwds,
-                )
+                ):
+                    has_explicit_pytest_cache_dir = True
                 continue
 
             if expect_pytest_cfg:
@@ -1461,6 +1481,10 @@ class RolePolicy:
             in_pytest_section = pytest_start_idx is not None and idx >= pytest_start_idx
             if in_pytest_section and expect_pytest_flag_val:
                 expect_pytest_flag_val = False
+                if expect_pytest_p:
+                    expect_pytest_p = False
+                    if tok == "no:cacheprovider":
+                        has_no_cacheprovider = True
             elif in_pytest_section:
                 if pytest_after_double_dash:
                     pytest_positional_args.append(tok)
@@ -1472,6 +1496,19 @@ class RolePolicy:
                     has_explicit_pytest_cfg = True
                 elif not tok.startswith("--") and len(tok) > 2 and _parse_bundled_pytest_c(tok)[0]:
                     has_explicit_pytest_cfg = True
+                elif tok == "-p":
+                    expect_pytest_flag_val = True
+                    expect_pytest_p = True
+                elif tok.startswith("-p") and not tok.startswith("--") and len(tok) > 2:
+                    if tok[2:] == "no:cacheprovider":
+                        has_no_cacheprovider = True
+                elif not tok.startswith("--") and len(tok) > 2 and _parse_bundled_pytest_p(tok)[0]:
+                    _, bundled_p = _parse_bundled_pytest_p(tok)
+                    if bundled_p is None:
+                        expect_pytest_flag_val = True
+                        expect_pytest_p = True
+                    elif bundled_p == "no:cacheprovider":
+                        has_no_cacheprovider = True
                 elif tok in _PYTEST_VALUE_LONG_FLAGS or _pytest_short_flag_expects_next_value(tok):
                     expect_pytest_flag_val = True
 
@@ -1488,6 +1525,7 @@ class RolePolicy:
                 continue
 
             if is_pytest and not in_cov_prefix and tok == "--rootdir":
+                has_explicit_pytest_rootdir = True
                 expect_pytest_rootdir = True
                 continue
 
@@ -1565,13 +1603,14 @@ class RolePolicy:
                         if attached_o is None:
                             expect_pytest_ini = True
                         else:
-                            self._check_pytest_override_ini(
+                            if self._check_pytest_override_ini(
                                 attached_o,
                                 command,
                                 in_pytest_addopts=in_pytest_addopts,
                                 effective_cwd=effective_cwd,
                                 lexical_cwds=lexical_cwds,
-                            )
+                            ):
+                                has_explicit_pytest_cache_dir = True
                         continue
 
                 # Glued short flags (`-o<val>`, `-d<val>`) must be checked BEFORE `if "=" in tok:`
@@ -1591,13 +1630,14 @@ class RolePolicy:
                                 command,
                                 "Read-only role cannot override pytest ini via '-o'",
                             )
-                        self._check_pytest_override_ini(
+                        if self._check_pytest_override_ini(
                             attached,
                             command,
                             in_pytest_addopts=in_pytest_addopts,
                             effective_cwd=effective_cwd,
                             lexical_cwds=lexical_cwds,
-                        )
+                        ):
+                            has_explicit_pytest_cache_dir = True
                     else:
                         if self.readonly:
                             raise ScopeViolationError(
@@ -1657,13 +1697,14 @@ class RolePolicy:
                                 command,
                                 f"Read-only role cannot override pytest ini via {flag_name!r}",
                             )
-                        self._check_pytest_override_ini(
+                        if self._check_pytest_override_ini(
                             flag_val,
                             command,
                             in_pytest_addopts=in_pytest_addopts,
                             effective_cwd=effective_cwd,
                             lexical_cwds=lexical_cwds,
-                        )
+                        ):
+                            has_explicit_pytest_cache_dir = True
                         continue
                     if is_pytest and not in_cov_prefix and flag_name == "--config-file":
                         self._validate_pytest_config_file(
@@ -1675,6 +1716,7 @@ class RolePolicy:
                         )
                         continue
                     if is_pytest and not in_cov_prefix and flag_name == "--rootdir":
+                        has_explicit_pytest_rootdir = True
                         self._validate_pytest_rootdir(flag_val, command, base_dir=effective_cwd)
                         continue
                     candidates = [flag_val]
@@ -1740,6 +1782,9 @@ class RolePolicy:
                 command,
                 effective_cwd=effective_cwd,
                 lexical_cwds=lexical_cwds,
+                has_explicit_cache_dir=has_explicit_pytest_cache_dir,
+                has_explicit_rootdir=has_explicit_pytest_rootdir,
+                has_no_cacheprovider=has_no_cacheprovider,
             )
 
         if is_ruff_mutating:
@@ -1909,6 +1954,9 @@ class RolePolicy:
         *,
         effective_cwd: Path | None = None,
         lexical_cwds: list[Path] | None = None,
+        has_explicit_cache_dir: bool = False,
+        has_explicit_rootdir: bool = False,
+        has_no_cacheprovider: bool = False,
     ) -> None:
         if effective_cwd is None:
             effective_cwd = self.worktree_root
@@ -2037,6 +2085,7 @@ class RolePolicy:
                             )
                 cur = cur.parent
 
+        has_root_anchoring_config = False
         for cfg_name in _PYTEST_CONFIG_FILENAMES:
             root_cfg = self.worktree_root / cfg_name
             if root_cfg.is_symlink() or root_cfg.exists():
@@ -2047,6 +2096,42 @@ class RolePolicy:
                     effective_cwd=effective_cwd,
                     lexical_cwds=lexical_cwds,
                 )
+                if root_cfg.is_file():
+                    if cfg_name in (
+                        "pytest.toml",
+                        ".pytest.toml",
+                        "pytest.ini",
+                        ".pytest.ini",
+                        "pyproject.toml",
+                    ):
+                        has_root_anchoring_config = True
+                    elif cfg_name == "tox.ini":
+                        parser = configparser.RawConfigParser(allow_no_value=True)
+                        try:
+                            parser.read_string(root_cfg.read_text(encoding="utf-8"))
+                        except (OSError, UnicodeDecodeError, configparser.Error):
+                            pass
+                        else:
+                            if parser.has_section("pytest"):
+                                has_root_anchoring_config = True
+                    elif cfg_name == "setup.cfg":
+                        parser = configparser.RawConfigParser(allow_no_value=True)
+                        try:
+                            parser.read_string(root_cfg.read_text(encoding="utf-8"))
+                        except (OSError, UnicodeDecodeError, configparser.Error):
+                            pass
+                        else:
+                            if parser.has_section("tool:pytest"):
+                                has_root_anchoring_config = True
+
+        if (
+            not has_root_anchoring_config
+            and not has_explicit_cache_dir
+            and not has_explicit_rootdir
+            and not has_no_cacheprovider
+            and effective_cwd != self.worktree_root
+        ):
+            self.enforce_write(".pytest_cache", base_dir=effective_cwd)
 
     def _validate_pytest_config_file(
         self,
@@ -2200,7 +2285,7 @@ class RolePolicy:
         from_config_file: bool = False,
         effective_cwd: Path | None = None,
         lexical_cwds: list[Path] | None = None,
-    ) -> None:
+    ) -> bool:
         if effective_cwd is None:
             effective_cwd = self.worktree_root
         if lexical_cwds is None:
@@ -2249,7 +2334,7 @@ class RolePolicy:
                         f"Malformed pytest addopts override syntax: {exc}",
                     ) from exc
                 if not addopts_tokens:
-                    return
+                    return False
                 for atok in addopts_tokens:
                     if (
                         atok in ("-c", "--config-file", "--rootdir", "--confcutdir", "--debug")
@@ -2272,7 +2357,7 @@ class RolePolicy:
                     effective_cwd=effective_cwd,
                     lexical_cwds=lexical_cwds,
                 )
-                return
+                return False
             if key_lower in ("log_file", "cache_dir", "basetemp", "resultlog"):
                 if self.readonly:
                     raise ScopeViolationError(
@@ -2287,9 +2372,9 @@ class RolePolicy:
                     self.enforce_write(ini_val.strip(), base_dir=self.worktree_root)
                     if effective_cwd != self.worktree_root:
                         self.enforce_write(ini_val.strip(), base_dir=effective_cwd)
-                else:
-                    self.enforce_write(ini_val.strip(), base_dir=effective_cwd)
-                return
+                    return True
+                self.enforce_write(ini_val.strip(), base_dir=effective_cwd)
+                return False
             try:
                 val_segments = shlex.split(ini_val)
             except ValueError:
@@ -2310,6 +2395,7 @@ class RolePolicy:
                         self._resolve_and_check_containment(
                             seg, "read", base_dir=effective_cwd
                         )
+        return False
 
     def _extract_tool_paths(
         self,
@@ -2361,6 +2447,13 @@ class RolePolicy:
         self, tool_name: str, tool_args: dict[str, Any] | str | None
     ) -> None:
         """Fail-closed validation of an agent tool invocation prior to execution."""
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            raise ScopeViolationError(
+                self.role,
+                "tool",
+                "<unknown>",
+                "Tool call missing toolName (fail closed)",
+            )
         norm_name = tool_name.strip().lower()
         args: dict[str, Any]
         if tool_args is None:
@@ -2371,10 +2464,37 @@ class RolePolicy:
                 args = parsed if isinstance(parsed, dict) else {"raw": tool_args}
             except json.JSONDecodeError:
                 args = {"raw": tool_args}
-        elif isinstance(tool_args, dict):
-            args = tool_args
+        elif isinstance(tool_args, Mapping):
+            args = dict(tool_args)
         else:
             args = {}
+
+        if norm_name in _SHELL_TOOLS or any(k in norm_name for k in ("bash", "shell", "exec")):
+            cmd_val: str | None = None
+            for key in _SHELL_CMD_KEYS:
+                val = args.get(key)
+                if isinstance(val, str) and val.strip():
+                    cmd_val = val
+                    break
+            if cmd_val is None and isinstance(args.get("raw"), str):
+                cmd_val = args["raw"]
+            if not cmd_val:
+                raise ScopeViolationError(
+                    self.role,
+                    "tool",
+                    tool_name,
+                    "Shell tool call missing command argument (fail closed)",
+                )
+            cwd_val = self._validate_shell_cwd_mapping(args, cmd_val)
+            self.enforce_shell(cmd_val, cwd=cwd_val)
+            return
+
+        non_shell_cwd = self._validate_shell_cwd_mapping(args, tool_name)
+        resolved_cwd = (
+            self._resolve_shell_cwd(non_shell_cwd, tool_name)[0]
+            if non_shell_cwd is not None
+            else self.worktree_root
+        )
 
         if norm_name in _WRITE_TOOLS or (
             norm_name not in _READ_TOOLS
@@ -2406,34 +2526,18 @@ class RolePolicy:
                     "Write/edit tool call missing extractable target path (fail closed)",
                 )
             for target in extracted:
-                self.enforce_write(target)
-            return
-
-        if norm_name in _SHELL_TOOLS or any(k in norm_name for k in ("bash", "shell", "exec")):
-            cmd_val: str | None = None
-            for key in _SHELL_CMD_KEYS:
-                val = args.get(key)
-                if isinstance(val, str) and val.strip():
-                    cmd_val = val
-                    break
-            if cmd_val is None and isinstance(args.get("raw"), str):
-                cmd_val = args["raw"]
-            if not cmd_val:
-                raise ScopeViolationError(
-                    self.role,
-                    "tool",
-                    tool_name,
-                    "Shell tool call missing command argument (fail closed)",
-                )
-            cwd_val = self._validate_shell_cwd_mapping(args, cmd_val)
-            self.enforce_shell(cmd_val, cwd=cwd_val)
+                self.enforce_write(target, base_dir=resolved_cwd)
+                if resolved_cwd != self.worktree_root:
+                    self.enforce_write(target, base_dir=self.worktree_root)
             return
 
         if norm_name in _READ_TOOLS:
             for target in self._extract_tool_paths(
                 args, include_patches=False, extra_keys=_READ_EXTRA_PATH_KEYS
             ):
-                self.enforce_read(target)
+                self.enforce_read(target, base_dir=resolved_cwd)
+                if resolved_cwd != self.worktree_root:
+                    self.enforce_read(target, base_dir=self.worktree_root)
             return
 
         if norm_name in ("git_merge", "git_push", "merge", "push"):
@@ -2452,11 +2556,15 @@ class RolePolicy:
         # Unrecognized tools carrying path args must be write-checked (fail closed),
         # while read/search directory keys must still satisfy worktree read containment.
         for target in self._extract_tool_paths(args):
-            self.enforce_write(target)
+            self.enforce_write(target, base_dir=resolved_cwd)
+            if resolved_cwd != self.worktree_root:
+                self.enforce_write(target, base_dir=self.worktree_root)
         for target in self._extract_tool_paths(
             args, include_patches=False, extra_keys=_READ_EXTRA_PATH_KEYS
         ):
-            self.enforce_read(target)
+            self.enforce_read(target, base_dir=resolved_cwd)
+            if resolved_cwd != self.worktree_root:
+                self.enforce_read(target, base_dir=self.worktree_root)
 
     def enforce_hook_payload(self, payload: Any) -> str:
         """Validate a pre-tool-use hook / event payload, forwarding top-level cwd keys.
@@ -2488,32 +2596,88 @@ class RolePolicy:
                 return True, getattr(payload, name)
             return False, None
 
-        raw_tool_name: Any = None
+        tool_name_entries: list[tuple[str, str]] = []
         for key in ("toolName", "tool_name"):
             present, val = _get_field(key)
             if present and val is not None:
-                raw_tool_name = val
-                break
-        if raw_tool_name is None:
-            tool_name = ""
-        elif isinstance(raw_tool_name, str):
-            tool_name = raw_tool_name
-        else:
+                if not isinstance(val, str):
+                    raise ScopeViolationError(
+                        self.role,
+                        "tool",
+                        str(val),
+                        f"Invalid {key} type {type(val).__name__} (fail closed)",
+                    )
+                stripped = val.strip()
+                if not stripped:
+                    raise ScopeViolationError(
+                        self.role,
+                        "tool",
+                        "<unknown>",
+                        f"Empty {key} in hook payload (fail closed)",
+                    )
+                tool_name_entries.append((key, stripped))
+
+        if not tool_name_entries:
             raise ScopeViolationError(
                 self.role,
                 "tool",
-                str(raw_tool_name),
-                f"Invalid toolName type {type(raw_tool_name).__name__} (fail closed)",
+                "<unknown>",
+                "Tool call missing toolName (fail closed)",
             )
 
-        has_tool_args = False
-        tool_args: Any = None
+        first_name_key, tool_name = tool_name_entries[0]
+        for key, val in tool_name_entries[1:]:
+            if val != tool_name:
+                raise ScopeViolationError(
+                    self.role,
+                    "tool",
+                    tool_name,
+                    f"Conflicting tool names between {first_name_key!r} and {key!r}",
+                )
+
+        def _normalize_args_value(raw_val: Any, key_name: str) -> dict[str, Any]:
+            if isinstance(raw_val, Mapping):
+                return dict(raw_val)
+            if isinstance(raw_val, str):
+                try:
+                    parsed = json.loads(raw_val)
+                except json.JSONDecodeError:
+                    return {"raw": raw_val}
+                if isinstance(parsed, dict):
+                    return dict(parsed)
+                if isinstance(parsed, str):
+                    return {"raw": parsed}
+                raise ScopeViolationError(
+                    self.role,
+                    "tool",
+                    tool_name,
+                    f"Malformed JSON {key_name} payload (fail closed)",
+                )
+            raise ScopeViolationError(
+                self.role,
+                "tool",
+                tool_name,
+                f"Malformed {key_name} type {type(raw_val).__name__} (fail closed)",
+            )
+
+        normalized_args_entries: list[tuple[str, dict[str, Any]]] = []
         for key in ("toolArgs", "tool_args", "args", "arguments", "input"):
             present, val = _get_field(key)
             if present and val is not None:
-                has_tool_args = True
-                tool_args = val
-                break
+                normalized_args_entries.append((key, _normalize_args_value(val, key)))
+
+        effective_args: dict[str, Any] | None = None
+        if normalized_args_entries:
+            first_args_key, first_args = normalized_args_entries[0]
+            for key, norm_args in normalized_args_entries[1:]:
+                if norm_args != first_args:
+                    raise ScopeViolationError(
+                        self.role,
+                        "tool",
+                        tool_name,
+                        f"Conflicting tool arguments between {first_args_key!r} and {key!r}",
+                    )
+            effective_args = dict(first_args)
 
         top_cwds: dict[str, Any] = {}
         for cwd_key in _SHELL_CWD_KEYS:
@@ -2522,43 +2686,18 @@ class RolePolicy:
                 top_cwds[cwd_key] = val
 
         if top_cwds:
-            cmd_label = tool_name or "<hook>"
-            if isinstance(tool_args, Mapping):
+            cmd_label = tool_name
+            if effective_args is not None:
                 for cmd_k in _SHELL_CMD_KEYS:
-                    cmd_cand = tool_args.get(cmd_k)
+                    cmd_cand = effective_args.get(cmd_k)
                     if isinstance(cmd_cand, str) and cmd_cand.strip():
                         cmd_label = cmd_cand
                         break
 
             self._validate_shell_cwd_mapping(top_cwds, cmd_label)
 
-            if isinstance(tool_args, str):
-                try:
-                    parsed_args = json.loads(tool_args)
-                except json.JSONDecodeError:
-                    parsed_args = {"raw": tool_args}
-                if isinstance(parsed_args, dict):
-                    effective_args: dict[str, Any] = dict(parsed_args)
-                elif isinstance(parsed_args, str):
-                    effective_args = {"raw": parsed_args}
-                else:
-                    raise ScopeViolationError(
-                        self.role,
-                        "tool",
-                        tool_name or "<unknown>",
-                        "Malformed JSON toolArgs payload with working directory (fail closed)",
-                    )
-            elif isinstance(tool_args, Mapping):
-                effective_args = dict(tool_args)
-            elif tool_args is None:
+            if effective_args is None:
                 effective_args = {}
-            else:
-                raise ScopeViolationError(
-                    self.role,
-                    "tool",
-                    tool_name or "<unknown>",
-                    f"Malformed toolArgs type {type(tool_args).__name__} (fail closed)",
-                )
 
             for k, v in top_cwds.items():
                 if k in effective_args and effective_args[k] is not None:
@@ -2577,16 +2716,8 @@ class RolePolicy:
                     effective_args[k] = v
 
             self._validate_shell_cwd_mapping(effective_args, cmd_label)
-            tool_args = effective_args
-        elif has_tool_args and not isinstance(tool_args, (Mapping, str)):
-            raise ScopeViolationError(
-                self.role,
-                "tool",
-                tool_name or "<unknown>",
-                f"Malformed toolArgs type {type(tool_args).__name__} (fail closed)",
-            )
 
-        self.enforce_tool_call(tool_name, tool_args)
+        self.enforce_tool_call(tool_name, effective_args)
         return tool_name
 
 
