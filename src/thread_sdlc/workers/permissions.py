@@ -136,10 +136,23 @@ _PATH_ARG_KEYS = (
     "targetPath",
     "target_file",
     "TargetFile",
+    "target",
+    "link",
+    "link_path",
+    "linkPath",
+    "output",
+    "output_path",
+    "outputPath",
+    "outputFile",
+    "junitxml",
+    "log_file",
+    "logFile",
+    "basetemp",
     "filename",
     "file",
     "file_name",
     "resolved_path",
+    "resolvedPath",
     "destination",
     "dest",
     "dst",
@@ -151,6 +164,26 @@ _PATH_ARG_KEYS = (
     "newPath",
     "directory",
     "dir",
+)
+
+_PATH_LIST_KEYS = frozenset({"paths", "files", "file_paths", "filePaths", "targets"})
+
+_FILE_WRITING_FLAGS = frozenset(
+    {
+        "--output",
+        "--output-file",
+        "--log-file",
+        "--junitxml",
+        "--junit-xml",
+        "--basetemp",
+        "--resultlog",
+        "--result-log",
+        "--cache-dir",
+    }
+)
+
+_ALLOWED_PYTHON_MODULES = frozenset(
+    {"pytest", "unittest", "py_compile", "compileall", "ruff", "mypy", "coverage"}
 )
 
 _SHELL_CMD_KEYS = ("command", "cmd", "script", "CommandLine", "full_command_text")
@@ -562,29 +595,65 @@ class RolePolicy:
                     f"Read-only role cannot execute mutating git command 'git {subcmd}'",
                 )
 
-        # Restrict inline code execution flags for python/node across all roles
+        # Restrict inline code execution flags and `-m <module>` for python across all roles
+        python_module: str | None = None
         if exe_lower == "python" or exe_lower.startswith("python3") or exe_lower.startswith("python2"):
             skip_next_py = False
+            expect_py_module = False
             for tok in tokens[1:]:
+                if expect_py_module:
+                    python_module = tok
+                    if python_module not in _ALLOWED_PYTHON_MODULES:
+                        raise ScopeViolationError(
+                            self.role,
+                            "shell",
+                            command,
+                            f"Python module {python_module!r} is not in allowed_python_modules {sorted(_ALLOWED_PYTHON_MODULES)}",
+                        )
+                    expect_py_module = False
+                    break
                 if skip_next_py:
                     skip_next_py = False
                     continue
                 if tok == "--":
                     break
-                if tok == "-m" or (tok.startswith("-m") and not tok.startswith("--")):
-                    break
                 if tok in ("-W", "-X", "--check-hash-based-pycs"):
                     skip_next_py = True
                     continue
+                if tok.startswith(("-W", "-X")) and not tok.startswith("--"):
+                    continue
                 if not tok.startswith("-"):
                     break
-                if not tok.startswith("--") and "c" in tok[1:]:
-                    raise ScopeViolationError(
-                        self.role,
-                        "shell",
-                        command,
-                        "Inline 'python -c' code execution is disallowed",
-                    )
+                if not tok.startswith("--"):
+                    if "c" in tok[1:]:
+                        raise ScopeViolationError(
+                            self.role,
+                            "shell",
+                            command,
+                            "Inline 'python -c' code execution is disallowed",
+                        )
+                    if "m" in tok[1:]:
+                        m_idx = tok.index("m", 1)
+                        mod_rest = tok[m_idx + 1 :]
+                        if mod_rest:
+                            python_module = mod_rest
+                            if python_module not in _ALLOWED_PYTHON_MODULES:
+                                raise ScopeViolationError(
+                                    self.role,
+                                    "shell",
+                                    command,
+                                    f"Python module {python_module!r} is not in allowed_python_modules {sorted(_ALLOWED_PYTHON_MODULES)}",
+                                )
+                            break
+                        expect_py_module = True
+                        continue
+            if expect_py_module:
+                raise ScopeViolationError(
+                    self.role,
+                    "shell",
+                    command,
+                    "Missing module name after 'python -m'",
+                )
 
         if exe_lower in ("node", "nodejs"):
             skip_next_node = False
@@ -628,16 +697,21 @@ class RolePolicy:
                 raise ScopeViolationError(
                     self.role, "shell", command, "Read-only role cannot run 'sed -i'"
                 )
-            if any(
-                t == "--output" or t.startswith("--output=") or t == "--ext-diff"
-                for t in tokens[1:]
-            ):
-                raise ScopeViolationError(
-                    self.role,
-                    "shell",
-                    command,
-                    "Read-only role cannot use file-writing '--output' / '--ext-diff' flags",
-                )
+            for t in tokens[1:]:
+                t_flag = t.split("=", 1)[0]
+                if (
+                    t_flag in _FILE_WRITING_FLAGS
+                    or t == "--ext-diff"
+                    or t.startswith("--ext-diff=")
+                    or t == "-o"
+                    or (t.startswith("-o") and not t.startswith("--"))
+                ):
+                    raise ScopeViolationError(
+                        self.role,
+                        "shell",
+                        command,
+                        f"Read-only role cannot use file-writing flag {t_flag!r}",
+                    )
 
         if not self.allowed_shell_prefixes:
             raise ScopeViolationError(
@@ -664,11 +738,68 @@ class RolePolicy:
                 f"Command {command!r} does not match allowed_shell_prefixes {self.allowed_shell_prefixes}",
             )
 
-        # Ensure path-like tokens (including --flag=path and glued -Xpath) stay contained
+        # Ensure file-writing flags (both `--flag=path` and `--flag path`) and path-like tokens stay in scope
+        is_pytest = exe_lower == "pytest" or python_module == "pytest"
+        expect_write_flag: str | None = None
+        expect_pytest_ini = False
+
         for tok in tokens[1:]:
+            if expect_write_flag is not None:
+                flag_used = expect_write_flag
+                expect_write_flag = None
+                if self.readonly:
+                    raise ScopeViolationError(
+                        self.role,
+                        "shell",
+                        command,
+                        f"Read-only role cannot use file-writing flag {flag_used!r}",
+                    )
+                self.enforce_write(tok)
+                continue
+
+            if expect_pytest_ini:
+                expect_pytest_ini = False
+                self._check_pytest_override_ini(tok, command)
+                continue
+
+            if tok in _FILE_WRITING_FLAGS or (not is_pytest and tok == "-o"):
+                if self.readonly:
+                    raise ScopeViolationError(
+                        self.role,
+                        "shell",
+                        command,
+                        f"Read-only role cannot use file-writing flag {tok!r}",
+                    )
+                expect_write_flag = tok
+                continue
+
+            if is_pytest and tok == "-o":
+                expect_pytest_ini = True
+                continue
+
             if tok.startswith("-"):
                 if "=" in tok:
                     flag_name, flag_val = tok.split("=", 1)
+                    if flag_name in _FILE_WRITING_FLAGS or (not is_pytest and flag_name == "-o"):
+                        if self.readonly:
+                            raise ScopeViolationError(
+                                self.role,
+                                "shell",
+                                command,
+                                f"Read-only role cannot use file-writing flag {flag_name!r}",
+                            )
+                        if not flag_val:
+                            raise ScopeViolationError(
+                                self.role,
+                                "shell",
+                                command,
+                                f"Missing target path for file-writing flag {flag_name!r}",
+                            )
+                        self.enforce_write(flag_val)
+                        continue
+                    if is_pytest and flag_name == "--override-ini":
+                        self._check_pytest_override_ini(flag_val, command)
+                        continue
                     candidates = [flag_val]
                     if ":" in flag_val and not (len(flag_val) >= 2 and flag_val[1] == ":"):
                         candidates.extend(seg for seg in flag_val.split(":") if seg)
@@ -676,44 +807,109 @@ class RolePolicy:
                         if "/" in cand or "\\" in cand or ".." in cand or Path(cand).is_absolute():
                             file_part = cand.split("::", 1)[0]
                             if file_part:
-                                if flag_name in ("--output", "--log-file", "--junitxml", "--junit-xml"):
-                                    self.enforce_write(file_part)
-                                else:
-                                    self._resolve_and_check_containment(file_part, "read")
+                                self._resolve_and_check_containment(file_part, "read")
                 elif len(tok) > 2 and not tok.startswith("--"):
+                    if tok.startswith("-o"):
+                        attached = tok[2:]
+                        if is_pytest:
+                            self._check_pytest_override_ini(attached, command)
+                        else:
+                            if self.readonly:
+                                raise ScopeViolationError(
+                                    self.role,
+                                    "shell",
+                                    command,
+                                    "Read-only role cannot use file-writing flag '-o'",
+                                )
+                            self.enforce_write(attached)
+                        continue
                     attached = tok[2:]
                     if "/" in attached or "\\" in attached or ".." in attached:
                         file_part = attached.split("::", 1)[0]
                         if file_part:
                             self._resolve_and_check_containment(file_part, "read")
                 continue
+
             if "/" in tok or "\\" in tok or ".." in tok or Path(tok).is_absolute():
                 # Allow pytest nodeids like tests/test_a.py::test_fn by stripping ::nodeid
                 file_part = tok.split("::", 1)[0]
                 if file_part:
                     self._resolve_and_check_containment(file_part, "read")
 
+        if expect_write_flag is not None:
+            raise ScopeViolationError(
+                self.role,
+                "shell",
+                command,
+                f"Missing target path for file-writing flag {expect_write_flag!r}",
+            )
+        if expect_pytest_ini:
+            raise ScopeViolationError(
+                self.role,
+                "shell",
+                command,
+                "Missing value for pytest '-o' flag",
+            )
+
         return tokens
 
-    def _extract_tool_paths(self, args: dict[str, Any]) -> list[str]:
+    def _check_pytest_override_ini(self, val: str, command: str) -> None:
+        if "=" in val:
+            ini_key, ini_val = val.split("=", 1)
+            key_lower = ini_key.strip().lower()
+            if key_lower in ("log_file", "cache_dir", "basetemp", "junit_logging", "resultlog"):
+                if self.readonly:
+                    raise ScopeViolationError(
+                        self.role,
+                        "shell",
+                        command,
+                        f"Read-only role cannot override pytest ini {ini_key!r}",
+                    )
+                self.enforce_write(ini_val.strip())
+                return
+            if "/" in ini_val or "\\" in ini_val or ".." in ini_val or Path(ini_val).is_absolute():
+                self._resolve_and_check_containment(ini_val.strip(), "read")
+
+    def _extract_tool_paths(
+        self, args: dict[str, Any], *, include_patches: bool = True
+    ) -> list[str]:
         extracted: list[str] = []
-        for key in _PATH_ARG_KEYS:
-            val = args.get(key)
+
+        def _walk_path_container(val: Any) -> None:
             if isinstance(val, str) and val.strip():
                 extracted.append(val.strip())
-        if isinstance(args.get("paths"), list):
-            extracted.extend(str(p) for p in args["paths"] if str(p).strip())
-        if isinstance(args.get("file_edits"), list):
-            for item in args["file_edits"]:
-                if isinstance(item, dict):
-                    for k in ("file_name", "path", "filePath"):
-                        v = item.get(k)
-                        if isinstance(v, str) and v.strip():
-                            extracted.append(v.strip())
-        for patch_key in ("patch", "diff", "input", "raw"):
-            patch_val = args.get(patch_key)
-            if isinstance(patch_val, str):
-                extracted.extend(_extract_patch_paths(patch_val))
+            elif isinstance(val, (list, tuple)):
+                for item in val:
+                    if isinstance(item, str) and item.strip():
+                        extracted.append(item.strip())
+                    elif isinstance(item, (dict, list, tuple)):
+                        _walk(item)
+            elif isinstance(val, dict):
+                _walk(val)
+
+        def _walk(node: Any) -> None:
+            if isinstance(node, dict):
+                for key, val in node.items():
+                    if key in _PATH_ARG_KEYS:
+                        if isinstance(val, str) and val.strip():
+                            extracted.append(val.strip())
+                        elif isinstance(val, (list, tuple, dict)):
+                            _walk_path_container(val)
+                    elif key in _PATH_LIST_KEYS:
+                        _walk_path_container(val)
+                    elif include_patches and key in ("patch", "diff", "input", "raw"):
+                        if isinstance(val, str):
+                            extracted.extend(_extract_patch_paths(val))
+                        elif isinstance(val, (dict, list, tuple)):
+                            _walk(val)
+                    elif isinstance(val, (dict, list, tuple)):
+                        _walk(val)
+            elif isinstance(node, (list, tuple)):
+                for item in node:
+                    if isinstance(item, (dict, list, tuple)):
+                        _walk(item)
+
+        _walk(args)
         return extracted
 
     def enforce_tool_call(
@@ -791,10 +987,19 @@ class RolePolicy:
             return
 
         if norm_name in _READ_TOOLS:
-            for key in _PATH_ARG_KEYS:
-                val = args.get(key)
-                if isinstance(val, str) and val.strip():
-                    self.enforce_read(val.strip())
+            for target in self._extract_tool_paths(args, include_patches=False):
+                self.enforce_read(target)
+            for cwd_key in (
+                "cwd",
+                "working_directory",
+                "workingDirectory",
+                "search_path",
+                "SearchPath",
+                "root",
+            ):
+                cwd_val = args.get(cwd_key)
+                if isinstance(cwd_val, str) and cwd_val.strip():
+                    self.enforce_read(cwd_val.strip())
             return
 
         if norm_name in ("git_merge", "git_push", "merge", "push"):

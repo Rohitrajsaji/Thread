@@ -1253,3 +1253,217 @@ def test_loader_and_worktree_minor_hardening(tmp_path: Path) -> None:
     _git(["commit", "-m", "Commit\n\nThread-Assignment-Id: asgn-10\n\nBody"], repo)
     assert wm.find_commit_by_assignment_id("asgn-1", repo) is None
     assert wm.find_commit_by_assignment_id("asgn-10", repo) is not None
+
+
+# ---------------------------------------------------------------------------
+# 9. Iteration 3 Regression Tests (R2 Challenger & Polish Fixes)
+# ---------------------------------------------------------------------------
+
+
+def test_shell_space_separated_file_writing_flags_and_python_m_allowlist(tmp_path: Path) -> None:
+    """Verify space-separated/= file-writing flags and python -m allowlist enforcement."""
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    be = RolePolicy(
+        role="backend",
+        worktree_root=wt,
+        allowed_paths=["app/**", "tests/**"],
+        denied_paths=[".thread/policy.yaml"],
+        allowed_shell_prefixes=["pytest", "python", "ruff", "git status", "git diff"],
+    )
+    ro = RolePolicy.from_scope_config("reviewer_readonly", ScopeConfig(), wt)
+
+    for bad_cmd in (
+        "pytest --junitxml .thread/policy.yaml tests/test_ok.py",
+        "pytest --log-file .thread/policy.yaml",
+        "pytest --junit-xml .thread/policy.yaml",
+        "pytest --basetemp=.thread/evil",
+        "pytest --basetemp .thread/evil",
+        "pytest --resultlog .thread/policy.yaml",
+        "pytest --result-log .thread/policy.yaml",
+        "pytest --cache-dir .thread/evil",
+        "pytest --junitxml out.xml",
+        "pytest -o cache_dir=.thread/evil",
+        "pytest --override-ini=log_file=.thread/policy.yaml",
+        "ruff check --output-file .thread/policy.yaml",
+        "ruff check --output-file=.thread/policy.yaml",
+        "ruff check -o .thread/policy.yaml",
+        "ruff check -o.thread/policy.yaml",
+        "git diff --output .thread/policy.yaml",
+        'python -m timeit -s "open(\'.thread/policy.yaml\',\'w\').write(\'x\')" "1"',
+        'python -Bm timeit -s "print(1)" "1"',
+        "python -m cProfile -o .thread/policy.yaml -m pytest",
+        "python -m http.server 8000",
+        "python -m pip install requests",
+        "python -m pytest --junitxml .thread/policy.yaml",
+        "python -mpytest --basetemp .thread/evil",
+        "python -m",
+    ):
+        with pytest.raises(ScopeViolationError):
+            be.enforce_shell(bad_cmd)
+
+    # Readonly rejects file-writing flags unconditionally
+    for ro_bad in (
+        "git diff --output=out.txt",
+        "git log --output out.txt",
+        "git show -o out.txt",
+    ):
+        with pytest.raises(ScopeViolationError):
+            ro.enforce_shell(ro_bad)
+
+    # Legitimate commands continue to pass
+    assert be.enforce_shell("pytest tests/unit")
+    assert be.enforce_shell("pytest -v")
+    assert be.enforce_shell("pytest -o filterwarnings=error tests/unit")
+    assert be.enforce_shell("pytest --junitxml tests/report.xml tests/unit")
+    assert be.enforce_shell("python -m pytest tests/unit")
+    assert be.enforce_shell("python -m unittest discover tests")
+    assert be.enforce_shell("python -m ruff check .")
+    assert be.enforce_shell("git diff")
+    assert be.enforce_shell("ruff check .")
+    assert ro.enforce_shell("git log --oneline")
+
+
+def test_read_tools_paths_list_nested_keys_and_tool_args_fallback(tmp_path: Path) -> None:
+    """Verify _READ_TOOLS checks paths/files/nested entries and unrecognized tools check target/link/outputFile."""
+    from copilot.generated.session_events import PermissionRequestCustomTool, PermissionRequestMcp
+
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    be = RolePolicy(
+        role="backend",
+        worktree_root=wt,
+        allowed_paths=["app/**", "tests/**"],
+        denied_paths=[".thread/policy.yaml"],
+    )
+    ro = RolePolicy.from_scope_config("reviewer_readonly", ScopeConfig(), wt)
+
+    # _READ_TOOLS paths/files/nested checks
+    for policy in (be, ro):
+        with pytest.raises(ScopeViolationError):
+            policy.enforce_tool_call("read_file", {"paths": ["/etc/passwd"]})
+        with pytest.raises(ScopeViolationError):
+            policy.enforce_tool_call("grep", {"paths": ["app/", "../outside.txt"]})
+        with pytest.raises(ScopeViolationError):
+            policy.enforce_tool_call("view_file", {"files": [{"path": "/etc/passwd"}]})
+
+    # In-scope _READ_TOOLS with paths list works
+    be.enforce_tool_call("read_file", {"paths": ["app/main.py", "tests/test_ok.py"]})
+
+    # Unrecognized tools with target/link/outputFile/nested paths are write-checked
+    with pytest.raises(ScopeViolationError):
+        be.enforce_tool_call("symlink", {"target": "/etc/passwd", "link": ".thread/policy.yaml"})
+    with pytest.raises(ScopeViolationError):
+        be.enforce_tool_call("custom_reporter", {"options": {"outputFile": ".thread/policy.yaml"}})
+    with pytest.raises(ScopeViolationError):
+        be.enforce_tool_call("custom_runner", {"junitxml": ".thread/policy.yaml"})
+
+    # SDK PermissionRequestMcp + tool_args fallback
+    sdk = CopilotSdkAdapter(be)
+    mcp_req = PermissionRequestMcp(
+        read_only=True,
+        server_name="fs",
+        tool_name="read_file",
+        tool_title="Read File",
+        args={"paths": ["/etc/passwd"]},
+    )
+    mcp_dec = asyncio.run(sdk._on_permission_request(mcp_req))
+    assert getattr(mcp_dec, "kind", None) == "denied-by-rules"
+
+    custom_req = PermissionRequestCustomTool(
+        tool_description="symlink",
+        tool_name="symlink",
+        args={"target": "/etc/passwd", "link": ".thread/policy.yaml"},
+    )
+    custom_dec = asyncio.run(sdk._on_permission_request(custom_req))
+    assert getattr(custom_dec, "kind", None) == "denied-by-rules"
+
+    dict_req = {"kind": "custom-tool", "tool_name": "read_file", "tool_args": {"paths": ["/etc/passwd"]}}
+    dict_dec = asyncio.run(sdk._on_permission_request(dict_req))
+    assert dict_dec["kind"] == "denied-by-rules"
+
+
+def test_sdk_midline_delta_buffering_and_nonjson_escaped_env_redaction(tmp_path: Path) -> None:
+    """Verify SDK line-buffered delta redaction prevents split PEM/token leaks and redactor handles KEY=\\\"...\\\"."""
+    repo = tmp_path / "repo"
+    base_sha = _init_git_repo(repo)
+    db = StateDatabase(repo_root=repo)
+    sr = StateRepository(db)
+    sr.create_thread(ThreadRecord(id="thr-sdk-buf", title="SDK Buf", base_sha=base_sha))
+    sr.create_ticket(TicketRecord(id="T-BUF", thread_id="thr-sdk-buf", title="Buf", role="backend"))
+
+    class _ChunkedSecretSession:
+        def __init__(self) -> None:
+            self._handlers: list[Any] = []
+
+        def on(self, cb: Any) -> None:
+            self._handlers.append(cb)
+
+        async def send_and_wait(self, prompt: str, *, timeout: float = 60.0) -> None:
+            chunks = [
+                "-----BEGIN RSA ",
+                "PRIVATE KEY-----\n",
+                "MIIEow_MIDLINE_",
+                "CHUNKED_SECRET\n",
+                "-----END RSA PRIVATE KEY-----\n",
+                "ghp_123456",
+                "7890abcdef1234\n",
+                "DONE_STREAM",
+            ]
+            for ch in chunks:
+                for h in self._handlers:
+                    h({"type": "assistant.message.delta", "data": {"delta_content": ch}})
+            for h in self._handlers:
+                h({"type": "session.idle", "data": {}})
+
+        async def disconnect(self) -> None:
+            return None
+
+    class _ChunkedSecretClient:
+        async def create_session(self, **kwargs: Any) -> _ChunkedSecretSession:
+            return _ChunkedSecretSession()
+
+    mgr = WorkerManager(
+        repo_root=repo,
+        db=db,
+        policy=PolicyConfig(),
+        scope=ScopeConfig(),
+        adapter_factory=lambda pol: CopilotSdkAdapter(
+            pol, client_factory=lambda: _ChunkedSecretClient()
+        ),
+    )
+    res = asyncio.run(mgr.dispatch_ticket("thr-sdk-buf", "T-BUF", "stream"))
+    assert res.log_path is not None
+
+    log_text = (repo / res.log_path).read_text(encoding="utf-8")
+    with sqlite3.connect(db.db_path) as conn:
+        events_text = "\n".join(
+            r[0] for r in conn.execute("SELECT payload_json FROM events").fetchall()
+        )
+
+    for forbidden in (
+        "-----BEGIN RSA",
+        "PRIVATE KEY-----",
+        "MIIEow_MIDLINE_CHUNKED_SECRET",
+        "MIIEow_MIDLINE_",
+        "ghp_123456",
+        "7890abcdef1234",
+    ):
+        assert forbidden not in log_text
+        assert forbidden not in events_text
+    assert "DONE_STREAM" in log_text
+    assert "DONE_STREAM" in events_text
+
+    # Non-JSON prefixed escaped quotes: log: {"env":"DB_PASSWORD=\"sec_dq_esc_1\""}
+    prefixed_line = 'log: {"env":"DB_PASSWORD=\\"sec_dq_esc_1\\""}'
+    scrubbed_line = redactor.redact_text(prefixed_line)
+    assert "sec_dq_esc_1" not in scrubbed_line
+
+    logger = EventLogger(db)
+    logger.emit("thr-sdk-buf", "escaped_env_log", prefixed_line)
+    with sqlite3.connect(db.db_path) as conn:
+        last_payload = conn.execute(
+            "SELECT payload_json FROM events WHERE type='escaped_env_log'"
+        ).fetchone()[0]
+    assert "sec_dq_esc_1" not in last_payload
+    assert isinstance(json.loads(last_payload), dict)

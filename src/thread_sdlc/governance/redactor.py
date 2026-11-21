@@ -41,7 +41,7 @@ _STANDALONE_BEARER_RE = re.compile(
 _URL_CREDENTIALS_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://[^:/@\s]+:)([^@/\s]+)(@)")
 
 _ENV_SECRET_KV_RE = re.compile(
-    r"""(?im)(^|[\s;|&"'{\[,:])((?:export\s+)?[A-Za-z_][A-Za-z0-9_]*(?:_SECRET|_TOKEN|_KEY|_PASSWORD|_PASSWD|_PWD|_CREDENTIAL|_CREDENTIALS)|(?:export\s+)?(?:SECRET|TOKEN|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY|ACCESS_KEY|AUTH_TOKEN|CLIENT_SECRET|BEARER_TOKEN))\s*=\s*(?:"((?:[^"\\\n]|\\.)*)"|'([^'\n]*)'|([^\s"'`\\;\n]+))"""
+    r"""(?im)(^|[\s;|&"'{\[,:])((?:export\s+)?[A-Za-z_][A-Za-z0-9_]*(?:_SECRET|_TOKEN|_KEY|_PASSWORD|_PASSWD|_PWD|_CREDENTIAL|_CREDENTIALS)|(?:export\s+)?(?:SECRET|TOKEN|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY|ACCESS_KEY|AUTH_TOKEN|CLIENT_SECRET|BEARER_TOKEN))\s*=\s*(?:"((?:[^"\\\n]|\\.)*)"|'([^'\n]*)'|\\"((?:[^\\"\n]|\\\\\\"|\\[^"\n])*)\\"|([^\s"'`\\;\n]+))"""
 )
 
 _SENSITIVE_DICT_KEY_RE = re.compile(
@@ -60,14 +60,25 @@ def _replace_env_kv(match: re.Match[str]) -> str:
     key = match.group(2)
     dq_val = match.group(3)
     sq_val = match.group(4)
-    uq_val = match.group(5)
-    raw_val = dq_val if dq_val is not None else (sq_val if sq_val is not None else (uq_val or ""))
+    esc_dq_val = match.group(5)
+    uq_val = match.group(6)
+    raw_val = (
+        dq_val
+        if dq_val is not None
+        else (
+            sq_val
+            if sq_val is not None
+            else (esc_dq_val if esc_dq_val is not None else (uq_val or ""))
+        )
+    )
     if raw_val == "" or raw_val.startswith("[REDACTED"):
         return match.group(0)
     if dq_val is not None:
         return f'{prefix}{key}="{REDACTED}"'
     if sq_val is not None:
         return f"{prefix}{key}='{REDACTED}'"
+    if esc_dq_val is not None:
+        return f'{prefix}{key}=\\"{REDACTED}\\"'
     return f"{prefix}{key}={REDACTED}"
 
 

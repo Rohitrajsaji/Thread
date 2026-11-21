@@ -130,6 +130,8 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
         self._send_task: asyncio.Task[Any] | None = None
         self._closed = False
         self._stream_redactor = redactor.StreamRedactor()
+        self._delta_buffer = ""
+        self._delta_event_type = "assistant.message.delta"
         self.start_count = 0
 
     def _enqueue_event(
@@ -137,7 +139,19 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
     ) -> None:
         self._queue.put_nowait(self._redact_event(event_type, message, data))
 
+    def _flush_delta_buffer(self) -> None:
+        if not self._delta_buffer:
+            return
+        buffered = self._delta_buffer
+        self._delta_buffer = ""
+        lines = buffered.splitlines(keepends=True) or [buffered]
+        scrubbed = "".join(self._stream_redactor.scrub_line(line) for line in lines)
+        self._enqueue_event(
+            "assistant_message", scrubbed, {"sdk_type": self._delta_event_type}
+        )
+
     def _finish_stream(self) -> None:
+        self._flush_delta_buffer()
         if not self._closed:
             self._closed = True
             self._queue.put_nowait(None)
@@ -250,7 +264,7 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
                 tool_name = str(
                     _extract_attr_or_key(request, "tool_name", "toolName", "kind") or "unknown"
                 )
-                args = _extract_attr_or_key(request, "args", "arguments", "toolArgs")
+                args = _extract_attr_or_key(request, "args", "arguments", "toolArgs", "tool_args")
                 self._policy.enforce_tool_call(tool_name, args)
         except ScopeViolationError as err:
             self._scope_violation = err
@@ -276,8 +290,36 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
         data = _extract_attr_or_key(event, "data") or {}
         norm = event_type.lower().replace("_", ".")
 
-        if norm in ("assistant.message.delta", "assistant.message"):
-            content = str(_extract_attr_or_key(data, "delta_content", "deltaContent", "content") or "")
+        if norm == "assistant.message.delta":
+            content = str(
+                _extract_attr_or_key(data, "delta_content", "deltaContent", "content") or ""
+            )
+            self._delta_event_type = event_type
+            if content:
+                self._delta_buffer += content
+                last_nl = self._delta_buffer.rfind("\n")
+                if last_nl != -1:
+                    complete = self._delta_buffer[: last_nl + 1]
+                    self._delta_buffer = self._delta_buffer[last_nl + 1 :]
+                    lines = complete.splitlines(keepends=True)
+                    scrubbed = "".join(self._stream_redactor.scrub_line(line) for line in lines)
+                    self._enqueue_event("assistant_message", scrubbed, {"sdk_type": event_type})
+                if self._delta_buffer and self._stream_redactor._in_pem_block:
+                    end_match = redactor._PEM_END_LINE_RE.search(self._delta_buffer)
+                    if end_match is not None:
+                        pem_end_part = self._delta_buffer[: end_match.end()]
+                        self._delta_buffer = self._delta_buffer[end_match.end() :]
+                        scrubbed = self._stream_redactor.scrub_line(pem_end_part)
+                        self._enqueue_event(
+                            "assistant_message", scrubbed, {"sdk_type": event_type}
+                        )
+            return
+
+        if norm == "assistant.message":
+            self._flush_delta_buffer()
+            content = str(
+                _extract_attr_or_key(data, "delta_content", "deltaContent", "content") or ""
+            )
             if content:
                 lines = content.splitlines(keepends=True) or [content]
                 content = "".join(self._stream_redactor.scrub_line(line) for line in lines)
@@ -315,6 +357,7 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
             return
 
         if norm == "session.error":
+            self._flush_delta_buffer()
             err_msg = str(_extract_attr_or_key(data, "message", "error") or "SDK session error")
             if is_quota_error(err_msg):
                 pq = PausedQuota(
@@ -333,6 +376,7 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
             return
 
         if norm in ("session.idle", "abort"):
+            self._flush_delta_buffer()
             if norm == "abort":
                 self._usage.aborted = True
                 self._enqueue_event("aborted", "SDK session aborted")
@@ -355,6 +399,8 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
         self._abort_requested = False
         self._closed = False
         self._stream_redactor = redactor.StreamRedactor()
+        self._delta_buffer = ""
+        self._delta_event_type = "assistant.message.delta"
 
         if self._client_factory is not None:
             self._client = self._client_factory()
@@ -464,6 +510,7 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
             self._send_task.cancel()
         if self._started_at_mono is not None:
             self._usage.duration_ms = (time.monotonic() - self._started_at_mono) * 1000.0
+        self._flush_delta_buffer()
         self._enqueue_event("aborted", "Copilot SDK session aborted")
         self._finish_stream()
 
