@@ -230,11 +230,8 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
     async def _on_pre_tool_use(
         self, input_data: dict[str, Any] | Any, invocation: Any = None
     ) -> dict[str, Any]:
-        tool_name = str(_extract_attr_or_key(input_data, "toolName", "tool_name") or "")
-        tool_args = _extract_attr_or_key(input_data, "toolArgs", "tool_args")
-
         try:
-            self._policy.enforce_tool_call(tool_name, tool_args)
+            tool_name = self._policy.enforce_hook_payload(input_data)
         except ScopeViolationError as err:
             self._scope_violation = err
             self._enqueue_event(
@@ -531,8 +528,7 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
                         kind,
                         f"SDK permission request {kind!r} missing tool_name (fail closed)",
                     )
-                args = _extract_attr_or_key(request, "args", "arguments", "toolArgs", "tool_args")
-                self._policy.enforce_tool_call(tool_name.strip(), args)
+                self._policy.enforce_hook_payload(request)
             elif kind == "url":
                 url = _extract_attr_or_key(request, "url", "uri") or "<unknown>"
                 raise ScopeViolationError(

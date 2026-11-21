@@ -9,6 +9,7 @@ import os
 import shlex
 import sys
 import tomllib
+from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -236,6 +237,7 @@ _PYTEST_CONFIG_FILENAMES = (
     "pytest.toml",
     ".pytest.toml",
     "pytest.ini",
+    ".pytest.ini",
     "pyproject.toml",
     "tox.ini",
     "setup.cfg",
@@ -1404,6 +1406,18 @@ class RolePolicy:
             )
             cov_flag_active = in_cov_prefix or (is_coverage and cov_nested_module is None)
 
+            in_pytest_arg_scope = (
+                (pytest_start_idx is not None and idx >= pytest_start_idx)
+                or (is_pytest and in_pytest_addopts)
+            )
+            if in_pytest_arg_scope and tok.startswith("@"):
+                raise ScopeViolationError(
+                    self.role,
+                    "shell",
+                    command,
+                    "Pytest '@argsfile' expansion is disallowed by Thread role policy",
+                )
+
             if expect_write_flag is not None:
                 flag_used = expect_write_flag
                 expect_write_flag = None
@@ -1961,7 +1975,7 @@ class RolePolicy:
                             command,
                             f"Symlink pytest config {rel_disp!r} in subdirectory is disallowed",
                         )
-                    if cfg_name in ("pytest.toml", ".pytest.toml", "pytest.ini"):
+                    if cfg_name in ("pytest.toml", ".pytest.toml", "pytest.ini", ".pytest.ini"):
                         raise ScopeViolationError(
                             self.role,
                             "shell",
@@ -2267,7 +2281,14 @@ class RolePolicy:
                         command,
                         f"Read-only role cannot override pytest ini {ini_key!r}",
                     )
-                self.enforce_write(ini_val.strip(), base_dir=effective_cwd)
+                if key_lower == "cache_dir":
+                    # Pytest resolves `cache_dir` relative to `rootdir` (`worktree_root` when a
+                    # root config exists, or `effective_cwd` otherwise); validate against both.
+                    self.enforce_write(ini_val.strip(), base_dir=self.worktree_root)
+                    if effective_cwd != self.worktree_root:
+                        self.enforce_write(ini_val.strip(), base_dir=effective_cwd)
+                else:
+                    self.enforce_write(ini_val.strip(), base_dir=effective_cwd)
                 return
             try:
                 val_segments = shlex.split(ini_val)
@@ -2437,6 +2458,137 @@ class RolePolicy:
         ):
             self.enforce_read(target)
 
+    def enforce_hook_payload(self, payload: Any) -> str:
+        """Validate a pre-tool-use hook / event payload, forwarding top-level cwd keys.
+
+        Returns the extracted ``tool_name`` if allowed, or raises ``ScopeViolationError``
+        (failing closed on malformed, conflicting, or out-of-scope payloads).
+        """
+        if payload is None:
+            raise ScopeViolationError(
+                self.role, "tool", "<unknown>", "Missing hook payload (fail closed)"
+            )
+        is_mapping = isinstance(payload, Mapping)
+        if not is_mapping and isinstance(
+            payload, (str, bytes, int, float, bool, list, tuple, set)
+        ):
+            raise ScopeViolationError(
+                self.role,
+                "tool",
+                "<malformed>",
+                f"Malformed hook payload type {type(payload).__name__} (fail closed)",
+            )
+
+        def _get_field(name: str) -> tuple[bool, Any]:
+            if is_mapping:
+                if name in payload:
+                    return True, payload[name]
+                return False, None
+            if hasattr(payload, name):
+                return True, getattr(payload, name)
+            return False, None
+
+        raw_tool_name: Any = None
+        for key in ("toolName", "tool_name"):
+            present, val = _get_field(key)
+            if present and val is not None:
+                raw_tool_name = val
+                break
+        if raw_tool_name is None:
+            tool_name = ""
+        elif isinstance(raw_tool_name, str):
+            tool_name = raw_tool_name
+        else:
+            raise ScopeViolationError(
+                self.role,
+                "tool",
+                str(raw_tool_name),
+                f"Invalid toolName type {type(raw_tool_name).__name__} (fail closed)",
+            )
+
+        has_tool_args = False
+        tool_args: Any = None
+        for key in ("toolArgs", "tool_args", "args", "arguments", "input"):
+            present, val = _get_field(key)
+            if present and val is not None:
+                has_tool_args = True
+                tool_args = val
+                break
+
+        top_cwds: dict[str, Any] = {}
+        for cwd_key in _SHELL_CWD_KEYS:
+            present, val = _get_field(cwd_key)
+            if present and val is not None:
+                top_cwds[cwd_key] = val
+
+        if top_cwds:
+            cmd_label = tool_name or "<hook>"
+            if isinstance(tool_args, Mapping):
+                for cmd_k in _SHELL_CMD_KEYS:
+                    cmd_cand = tool_args.get(cmd_k)
+                    if isinstance(cmd_cand, str) and cmd_cand.strip():
+                        cmd_label = cmd_cand
+                        break
+
+            self._validate_shell_cwd_mapping(top_cwds, cmd_label)
+
+            if isinstance(tool_args, str):
+                try:
+                    parsed_args = json.loads(tool_args)
+                except json.JSONDecodeError:
+                    parsed_args = {"raw": tool_args}
+                if isinstance(parsed_args, dict):
+                    effective_args: dict[str, Any] = dict(parsed_args)
+                elif isinstance(parsed_args, str):
+                    effective_args = {"raw": parsed_args}
+                else:
+                    raise ScopeViolationError(
+                        self.role,
+                        "tool",
+                        tool_name or "<unknown>",
+                        "Malformed JSON toolArgs payload with working directory (fail closed)",
+                    )
+            elif isinstance(tool_args, Mapping):
+                effective_args = dict(tool_args)
+            elif tool_args is None:
+                effective_args = {}
+            else:
+                raise ScopeViolationError(
+                    self.role,
+                    "tool",
+                    tool_name or "<unknown>",
+                    f"Malformed toolArgs type {type(tool_args).__name__} (fail closed)",
+                )
+
+            for k, v in top_cwds.items():
+                if k in effective_args and effective_args[k] is not None:
+                    arg_v = effective_args[k]
+                    if (
+                        not isinstance(arg_v, (str, Path))
+                        or str(arg_v).strip() != str(v).strip()
+                    ):
+                        raise ScopeViolationError(
+                            self.role,
+                            "shell",
+                            str(effective_args.get("command") or cmd_label),
+                            f"Conflicting working directory between hook payload and toolArgs for {k!r}",
+                        )
+                else:
+                    effective_args[k] = v
+
+            self._validate_shell_cwd_mapping(effective_args, cmd_label)
+            tool_args = effective_args
+        elif has_tool_args and not isinstance(tool_args, (Mapping, str)):
+            raise ScopeViolationError(
+                self.role,
+                "tool",
+                tool_name or "<unknown>",
+                f"Malformed toolArgs type {type(tool_args).__name__} (fail closed)",
+            )
+
+        self.enforce_tool_call(tool_name, tool_args)
+        return tool_name
+
 
 def _run_pre_tool_use_hook() -> int:
     """Entrypoint invoked by Copilot CLI `preToolUse` hook via `python -m thread_sdlc.workers.permissions`."""
@@ -2485,46 +2637,8 @@ def _run_pre_tool_use_hook() -> int:
         )
         return 0
 
-    tool_name = str(payload.get("toolName") or payload.get("tool_name") or "")
-    tool_args = payload.get("toolArgs") if "toolArgs" in payload else payload.get("tool_args")
-
     try:
-        if isinstance(payload, dict):
-            top_cwds = {
-                k: payload[k]
-                for k in _SHELL_CWD_KEYS
-                if k in payload and payload[k] is not None
-            }
-            if top_cwds:
-                if isinstance(tool_args, str):
-                    try:
-                        parsed_args = json.loads(tool_args)
-                    except json.JSONDecodeError:
-                        parsed_args = {"raw": tool_args}
-                    effective_args: dict[str, Any] = (
-                        dict(parsed_args)
-                        if isinstance(parsed_args, dict)
-                        else {"raw": tool_args}
-                    )
-                elif isinstance(tool_args, dict):
-                    effective_args = dict(tool_args)
-                else:
-                    effective_args = {}
-
-                for k, v in top_cwds.items():
-                    if k in effective_args and effective_args[k] is not None:
-                        if str(effective_args[k]).strip() != str(v).strip():
-                            raise ScopeViolationError(
-                                policy.role,
-                                "shell",
-                                str(effective_args.get("command") or tool_name),
-                                f"Conflicting working directory between hook payload and toolArgs for {k!r}",
-                            )
-                    else:
-                        effective_args[k] = v
-                tool_args = effective_args
-
-        policy.enforce_tool_call(tool_name, tool_args)
+        policy.enforce_hook_payload(payload)
     except ScopeViolationError as err:
         if sentinel_path:
             sp = Path(sentinel_path)

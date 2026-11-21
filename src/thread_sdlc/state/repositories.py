@@ -402,10 +402,109 @@ class StateRepository:
             ).fetchone()
             return int(row["cnt"]) if row is not None else 0
 
+    def reserve_running_assignment(
+        self,
+        *,
+        thread_id: str,
+        assignment: AssignmentRecord,
+        max_workers_per_thread: int,
+        max_retries_per_ticket: int,
+        max_credits_per_thread: float,
+    ) -> tuple[ThreadRecord, TicketRecord, str | None, dict[str, Any]]:
+        """Atomically check quota/concurrency/retry caps and insert a ``running`` assignment."""
+        with self.db.transaction() as conn:
+            thread_row = conn.execute(
+                "SELECT * FROM threads WHERE id = ?", (thread_id,)
+            ).fetchone()
+            if thread_row is None:
+                raise KeyError(f"Thread {thread_id!r} not found")
+            thread = _row_to_thread(thread_row)
+
+            ticket_row = conn.execute(
+                "SELECT * FROM tickets WHERE id = ?", (assignment.ticket_id,)
+            ).fetchone()
+            if ticket_row is None:
+                raise KeyError(f"Ticket {assignment.ticket_id!r} not found")
+            ticket = _row_to_ticket(ticket_row)
+
+            if (
+                thread.status == "PausedQuota"
+                or thread.credits_used >= max_credits_per_thread
+            ):
+                return thread, ticket, "paused_quota", {}
+
+            active_row = conn.execute(
+                """
+                SELECT COUNT(*) AS cnt FROM assignments a
+                JOIN tickets t ON t.id = a.ticket_id
+                WHERE t.thread_id = ? AND a.status = 'running'
+                """,
+                (thread_id,),
+            ).fetchone()
+            active_workers = int(active_row["cnt"]) if active_row is not None else 0
+            if active_workers >= max_workers_per_thread:
+                return (
+                    thread,
+                    ticket,
+                    "concurrency_limit",
+                    {"active_workers": active_workers},
+                )
+
+            prior_rows = conn.execute(
+                "SELECT status FROM assignments WHERE ticket_id = ?",
+                (assignment.ticket_id,),
+            ).fetchall()
+            failed_attempts = sum(1 for r in prior_rows if r["status"] == "failed")
+            if failed_attempts > max_retries_per_ticket:
+                return (
+                    thread,
+                    ticket,
+                    "retry_limit",
+                    {"failed_attempts": failed_attempts},
+                )
+
+            existing_row = conn.execute(
+                "SELECT status FROM assignments WHERE id = ?",
+                (assignment.id,),
+            ).fetchone()
+            if existing_row is not None:
+                return (
+                    thread,
+                    ticket,
+                    "duplicate_assignment",
+                    {"existing_status": existing_row["status"]},
+                )
+
+            conn.execute(
+                """
+                INSERT INTO assignments (
+                    id, ticket_id, adapter_type, status, base_sha, result_sha,
+                    commit_trailer, turns_used, credits_used, log_path, started_at, ended_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    assignment.id,
+                    assignment.ticket_id,
+                    assignment.adapter_type,
+                    "running",
+                    assignment.base_sha,
+                    assignment.result_sha,
+                    assignment.commit_trailer,
+                    assignment.turns_used,
+                    assignment.credits_used,
+                    assignment.log_path,
+                    assignment.started_at,
+                    assignment.ended_at,
+                ),
+            )
+            return thread, ticket, None, {"active_workers": active_workers}
+
     def update_assignment(
         self,
         assignment_id: str,
         *,
+        adapter_type: str | None = None,
+        base_sha: str | None = None,
         status: str | None = None,
         result_sha: str | None = None,
         turns_used: int | None = None,
@@ -415,6 +514,12 @@ class StateRepository:
     ) -> AssignmentRecord | None:
         fields: list[str] = []
         params: list[Any] = []
+        if adapter_type is not None:
+            fields.append("adapter_type = ?")
+            params.append(adapter_type)
+        if base_sha is not None:
+            fields.append("base_sha = ?")
+            params.append(base_sha)
         if status is not None:
             fields.append("status = ?")
             params.append(status)

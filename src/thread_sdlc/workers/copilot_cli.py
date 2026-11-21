@@ -313,10 +313,8 @@ class CopilotCliSubprocessAdapter(BaseWorkerAdapter):
                 if parsed_json is not None:
                     evt_type = str(parsed_json.get("type") or "")
                     if evt_type in ("tool_request", "pre_tool_use"):
-                        t_name = str(parsed_json.get("toolName") or parsed_json.get("tool_name") or "")
-                        t_args = parsed_json.get("toolArgs") or parsed_json.get("tool_args")
                         try:
-                            self._policy.enforce_tool_call(t_name, t_args)
+                            self._policy.enforce_hook_payload(parsed_json)
                         except ScopeViolationError as err:
                             self._scope_violation = err
                             yield self._redact_event(

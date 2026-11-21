@@ -254,8 +254,27 @@ class WorkerManager:
                 result_sha=rec.result_sha,
             )
 
-        # Step 2: Enforce caps BEFORE launching a worker (zero retry loop)
-        if thread.status == "PausedQuota" or thread.credits_used >= self.policy.caps.max_credits_per_thread:
+        # Step 2: Atomically enforce caps and reserve running assignment inside BEGIN IMMEDIATE
+        asgn_id = assignment_id or f"asgn-{uuid.uuid4().hex[:12]}"
+        log_rel_path = f".thread-state/redacted-logs/{asgn_id}.log"
+        trailer = self.worktree_manager.commit_trailer(asgn_id)
+
+        thread, ticket, rejection, meta = self.repo.reserve_running_assignment(
+            thread_id=thread_id,
+            assignment=AssignmentRecord(
+                id=asgn_id,
+                ticket_id=ticket_id,
+                adapter_type="pending",
+                status="running",
+                base_sha=thread.base_sha,
+                commit_trailer=trailer,
+                log_path=log_rel_path,
+            ),
+            max_workers_per_thread=self.policy.caps.max_workers_per_thread,
+            max_retries_per_ticket=self.policy.caps.max_retries_per_ticket,
+            max_credits_per_thread=self.policy.caps.max_credits_per_thread,
+        )
+        if rejection == "paused_quota":
             raise PausedQuota(
                 f"Thread {thread_id} has exhausted credit budget "
                 f"({thread.credits_used}/{self.policy.caps.max_credits_per_thread})",
@@ -263,62 +282,73 @@ class WorkerManager:
                 credits_used=thread.credits_used,
                 turns_used=thread.turns_used,
             )
-
-        active_workers = self.repo.count_active_assignments(thread_id)
-        if active_workers >= self.policy.caps.max_workers_per_thread:
+        if rejection == "concurrency_limit":
+            active_workers = meta.get("active_workers", self.policy.caps.max_workers_per_thread)
             raise WorkerConcurrencyError(
                 f"Active workers ({active_workers}) reached max_workers_per_thread "
                 f"({self.policy.caps.max_workers_per_thread})"
             )
-
-        prior_assignments = self.repo.list_assignments_for_ticket(ticket_id)
-        failed_attempts = sum(1 for a in prior_assignments if a.status == "failed")
-        if failed_attempts > self.policy.caps.max_retries_per_ticket:
+        if rejection == "retry_limit":
             raise WorkerRetryLimitError(
                 f"Ticket {ticket_id} exceeded max_retries_per_ticket "
                 f"({self.policy.caps.max_retries_per_ticket})"
             )
-
-        # Step 3: Ensure isolated worktree
-        base_ref = thread.base_sha or self.policy.base_branch
-        worktree = self.worktree_manager.ensure_worktree(thread_id, ticket_id, base_ref=base_ref)
-
-        # Step 4: Persist running assignment BEFORE invoking worker
-        asgn_id = assignment_id or f"asgn-{uuid.uuid4().hex[:12]}"
-        log_rel_path = f".thread-state/redacted-logs/{asgn_id}.log"
-        trailer = self.worktree_manager.commit_trailer(asgn_id)
-        role_policy = RolePolicy.from_scope_config(ticket.role, self.scope, worktree.path)
-        adapter = self.adapter_factory(role_policy)
-        adapter_type = type(adapter).__name__
-
-        self.repo.create_assignment(
-            AssignmentRecord(
-                id=asgn_id,
-                ticket_id=ticket_id,
-                adapter_type=adapter_type,
-                status="running",
-                base_sha=worktree.base_sha,
-                commit_trailer=trailer,
-                log_path=log_rel_path,
+        if rejection == "duplicate_assignment":
+            raise WorkerConcurrencyError(
+                f"Assignment {asgn_id!r} already exists with status {meta.get('existing_status')!r}"
             )
-        )
-        self.repo.update_ticket(
-            ticket_id,
-            status="in_progress",
-            worktree_branch=worktree.branch,
-            worktree_path=str(worktree.path),
-        )
-        self.events.emit(
-            thread_id,
-            "assignment_started",
-            {
-                "assignment_id": asgn_id,
-                "ticket_id": ticket_id,
-                "role": ticket.role,
-                "branch": worktree.branch,
-                "adapter": adapter_type,
-            },
-        )
+
+        # Step 3 & 4: Ensure isolated worktree and instantiate adapter; clean up on setup failure
+        try:
+            base_ref = thread.base_sha or self.policy.base_branch
+            worktree = self.worktree_manager.ensure_worktree(
+                thread_id, ticket_id, base_ref=base_ref
+            )
+            role_policy = RolePolicy.from_scope_config(ticket.role, self.scope, worktree.path)
+            adapter = self.adapter_factory(role_policy)
+            adapter_type = type(adapter).__name__
+
+            self.repo.update_assignment(
+                asgn_id,
+                adapter_type=adapter_type,
+                base_sha=worktree.base_sha,
+            )
+            self.repo.update_ticket(
+                ticket_id,
+                status="in_progress",
+                worktree_branch=worktree.branch,
+                worktree_path=str(worktree.path),
+            )
+            self.events.emit(
+                thread_id,
+                "assignment_started",
+                {
+                    "assignment_id": asgn_id,
+                    "ticket_id": ticket_id,
+                    "role": ticket.role,
+                    "branch": worktree.branch,
+                    "adapter": adapter_type,
+                },
+            )
+        except BaseException as exc:
+            self.repo.update_assignment(
+                asgn_id,
+                status="failed",
+                ended_at=utc_now_iso(),
+            )
+            self.repo.update_ticket(ticket_id, status="failed")
+            self.events.emit(
+                thread_id,
+                "assignment_failed",
+                {
+                    "assignment_id": asgn_id,
+                    "ticket_id": ticket_id,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc) or "Worker setup failed",
+                    "phase": "setup",
+                },
+            )
+            raise
 
         # Step 5: Execute worker with redacted logging and live cap checks
         remaining_credits = max(0.0, self.policy.caps.max_credits_per_thread - thread.credits_used)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -467,3 +468,100 @@ def test_external_abort_marks_failed_instead_of_completed(tmp_path: Path) -> Non
     events = mgr.events.list_events("thr-ext-abort")
     assert any(e.type == "assignment_failed" for e in events)
     assert not any(e.type == "assignment_completed" for e in events)
+
+
+def test_concurrent_dispatch_ticket_enforces_max_workers_atomically_and_cleans_up_setup_failure(
+    tmp_path: Path,
+) -> None:
+    """Two OS threads synchronized on a barrier cannot both bypass max_workers_per_thread=1, and setup failure frees the slot."""
+    import threading
+
+    from thread_sdlc.workers import WorkerConcurrencyError, WorktreeError
+
+    repo, base_sha = _setup_repo(tmp_path)
+    db = StateDatabase(repo_root=repo)
+    sr = StateRepository(db)
+    sr.create_thread(ThreadRecord(id="thr-mt", title="Concurrent", base_sha=base_sha))
+    sr.create_ticket(TicketRecord(id="TM1", thread_id="thr-mt", title="TM1", role="backend"))
+    sr.create_ticket(TicketRecord(id="TM2", thread_id="thr-mt", title="TM2", role="backend"))
+
+    policy = PolicyConfig()
+    policy.caps.max_workers_per_thread = 1
+
+    started_lock = threading.Lock()
+    started_count = 0
+
+    class _SlowSuccessAdapter(MockWorkerAdapter):
+        async def start(self, assignment: Any) -> None:
+            nonlocal started_count
+            with started_lock:
+                started_count += 1
+            await asyncio.sleep(0.15)
+            await super().start(assignment)
+
+    mgr = WorkerManager(
+        repo_root=repo,
+        db=db,
+        policy=policy,
+        scope=ScopeConfig(),
+        adapter_factory=lambda pol: _SlowSuccessAdapter(pol, scenario="commit_success"),
+    )
+
+    barrier = threading.Barrier(2)
+    results: list[tuple[str, Any]] = []
+    res_lock = threading.Lock()
+
+    def _run_dispatch(ticket_id: str) -> None:
+        barrier.wait(timeout=5.0)
+        try:
+            res = asyncio.run(mgr.dispatch_ticket("thr-mt", ticket_id, "work"))
+            with res_lock:
+                results.append(("ok", res))
+        except Exception as exc:
+            with res_lock:
+                results.append(("err", exc))
+
+    t1 = threading.Thread(target=_run_dispatch, args=("TM1",))
+    t2 = threading.Thread(target=_run_dispatch, args=("TM2",))
+    t1.start()
+    t2.start()
+    t1.join(timeout=15.0)
+    t2.join(timeout=15.0)
+
+    assert len(results) == 2
+    ok_items = [item for kind, item in results if kind == "ok"]
+    err_items = [item for kind, item in results if kind == "err"]
+    assert len(ok_items) == 1, f"Expected exactly 1 completed dispatch, got {results!r}"
+    assert len(err_items) == 1 and isinstance(err_items[0], WorkerConcurrencyError), (
+        f"Expected exactly 1 WorkerConcurrencyError, got {results!r}"
+    )
+    assert ok_items[0].status == "completed"
+    assert started_count == 1
+    assert sr.count_active_assignments("thr-mt") == 0
+
+    # Verify ensure_worktree setup failure marks reservation failed and does NOT wedge future dispatches
+    sr.create_ticket(TicketRecord(id="TM3", thread_id="thr-mt", title="TM3", role="backend"))
+    sr.create_ticket(TicketRecord(id="TM4", thread_id="thr-mt", title="TM4", role="backend"))
+
+    # Create a non-worktree directory at `.thread-state/worktrees/TM3` to trigger WorktreeError
+    conflict_dir = repo / ".thread-state" / "worktrees" / "TM3"
+    conflict_dir.mkdir(parents=True, exist_ok=True)
+    (conflict_dir / "blocker.txt").write_text("block", encoding="utf-8")
+
+    with pytest.raises(WorktreeError):
+        asyncio.run(mgr.dispatch_ticket("thr-mt", "TM3", "should fail setup", assignment_id="asgn-tm3-fail"))
+
+    failed_tm3 = sr.get_assignment("asgn-tm3-fail")
+    assert failed_tm3 is not None
+    assert failed_tm3.status == "failed"
+    assert failed_tm3.ended_at is not None
+    assert sr.get_ticket("TM3").status == "failed"
+    assert sr.count_active_assignments("thr-mt") == 0
+    assert any(
+        e.type == "assignment_failed" and "asgn-tm3-fail" in e.payload_json
+        for e in mgr.events.list_events("thr-mt")
+    )
+
+    # TM4 must dispatch cleanly without WorkerConcurrencyError
+    res_tm4 = asyncio.run(mgr.dispatch_ticket("thr-mt", "TM4", "succeed after setup fail"))
+    assert res_tm4.status == "completed"
