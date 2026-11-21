@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "thread-sdlc"
+version = "0.1.0"
+description = "Installable, stack-agnostic, repository-native Agentic SDLC orchestrator for GitHub Copilot Business teams"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "typer>=0.12.0",
+    "rich>=13.7.0",
+    "pydantic>=2.7.0",
+    "pyyaml>=6.0.1",
+    "jinja2>=3.1.4",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "mcp>=1.0.0",
+    "httpx>=0.27.0",
+]
+
+[project.optional-dependencies]
+copilot = [
+    "github-copilot-sdk>=1.0.0",
+]
+dev = [
+    "pytest>=8.0.0",
+    "build>=1.2.0",
+    "hatchling>=1.24",
+]
+
+[project.scripts]
+thread = "thread_sdlc.cli.main:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/thread_sdlc"]
+include = [
+    "src/thread_sdlc/ui/static/**",
+    "src/thread_sdlc/compiler/templates/**",
+]
+artifacts = [
+    "src/thread_sdlc/ui/static/**",
+    "src/thread_sdlc/compiler/templates/**",
+]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/**",
+    "README.md",
+    "pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

@@ -1,0 +1,21 @@
+# Python / virtualenvs / packaging
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Thread durable local state & worktrees
+.thread-state/
+
+# Node / Web UI build dependencies (compiled output goes to src/thread_sdlc/ui/static/)
+web/node_modules/
+web/.vite/
+
+# OS / IDE
+.DS_Store
