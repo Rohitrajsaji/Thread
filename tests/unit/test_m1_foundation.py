@@ -1467,3 +1467,173 @@ def test_sdk_midline_delta_buffering_and_nonjson_escaped_env_redaction(tmp_path:
         ).fetchone()[0]
     assert "sec_dq_esc_1" not in last_payload
     assert isinstance(json.loads(last_payload), dict)
+
+
+# ---------------------------------------------------------------------------
+# 10. Iteration 4 Regression Tests (R3 Challenger & Reviewer Findings)
+# ---------------------------------------------------------------------------
+
+
+def test_pytest_override_ini_glued_o_and_junit_logging(tmp_path: Path) -> None:
+    """Verify space-separated --override-ini, glued -o<kv>, and non-path junit_logging enum."""
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    be = RolePolicy(
+        role="backend",
+        worktree_root=wt,
+        allowed_paths=["app/**", "tests/**"],
+        denied_paths=[".thread/policy.yaml"],
+        deny_gate_files=["tests/acceptance/**"],
+        allowed_shell_prefixes=["pytest", "python", "ruff", "git status", "git diff"],
+    )
+    ro = RolePolicy(
+        role="reviewer_readonly",
+        worktree_root=wt,
+        allowed_paths=[],
+        denied_paths=["**"],
+        allowed_shell_prefixes=["pytest"],
+        readonly=True,
+    )
+
+    for bad_cmd in (
+        "pytest --override-ini log_file=.thread/policy.yaml tests/test_ok.py",
+        "pytest --override-ini cache_dir=.thread/evil tests/test_ok.py",
+        "pytest --override-ini log_file=../outside.log tests/test_ok.py",
+        "pytest -olog_file=.thread/policy.yaml tests/test_ok.py",
+        "pytest -ocache_dir=.thread/evil tests/test_ok.py",
+        "python -m pytest --override-ini log_file=.thread/policy.yaml tests/test_ok.py",
+        "python -m pytest --override-ini cache_dir=.thread/evil tests/test_ok.py",
+        "python -m pytest -olog_file=.thread/policy.yaml tests/test_ok.py",
+        "python -m pytest -ocache_dir=.thread/evil tests/test_ok.py",
+        "pytest --override-ini",
+    ):
+        with pytest.raises(ScopeViolationError):
+            be.enforce_shell(bad_cmd)
+
+    with pytest.raises(ScopeViolationError):
+        ro.enforce_shell("pytest --override-ini filterwarnings=error tests/test_ok.py")
+
+    assert be.enforce_shell("pytest -o junit_logging=all tests/unit")
+    assert be.enforce_shell("pytest --override-ini junit_logging=system-out tests/unit")
+    assert be.enforce_shell("pytest -ofilterwarnings=error tests/unit")
+
+
+def test_coverage_nested_module_outputs_and_ruff_mutating_commands(tmp_path: Path) -> None:
+    """Verify python -m coverage nested -m/-d/-o/--data-file and ruff format/--fix protections."""
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    be = RolePolicy(
+        role="backend",
+        worktree_root=wt,
+        allowed_paths=["app/**", "tests/**"],
+        denied_paths=[".thread/policy.yaml"],
+        deny_gate_files=["tests/acceptance/**"],
+        allowed_shell_prefixes=["pytest", "python", "ruff", "git status", "git diff"],
+    )
+    ro = RolePolicy(
+        role="reviewer_readonly",
+        worktree_root=wt,
+        allowed_paths=[],
+        denied_paths=["**"],
+        allowed_shell_prefixes=["python", "ruff"],
+        readonly=True,
+    )
+
+    for bad_cov in (
+        'python -m coverage run -m timeit -s "open(\'.thread/policy.yaml\',\'w\').write(\'x\')" "1"',
+        'python -m coverage run -mtimeit -s "1" "1"',
+        "python -m coverage run --module=http.server 8000",
+        'python -m coverage run -c "print(1)"',
+        'python -m coverage -c "print(1)"',
+        "python -m coverage html -d .thread/evil",
+        "python -m coverage html -d.thread/evil",
+        "python -m coverage html --directory=.thread/evil",
+        "python -m coverage xml -o .thread/evil.xml",
+        "python -m coverage xml -o.thread/evil.xml",
+        "python -m coverage json --output=.thread/evil.json",
+        "python -m coverage run --data-file .thread/evil -m pytest tests/unit",
+        "python -m coverage run --data-file=.thread/evil -m pytest tests/unit",
+        "python -m coverage run -m pytest --override-ini log_file=.thread/policy.yaml tests/unit",
+    ):
+        with pytest.raises(ScopeViolationError):
+            be.enforce_shell(bad_cov)
+
+    with pytest.raises(ScopeViolationError):
+        ro.enforce_shell("python -m coverage html -d tests/htmlcov")
+
+    assert be.enforce_shell("python -m coverage run -m pytest tests/unit")
+    assert be.enforce_shell("python -m coverage report -m")
+    assert be.enforce_shell("python -m coverage html -d tests/htmlcov")
+
+    for bad_ruff in (
+        "ruff format tests/acceptance/test_gate.py",
+        "ruff format .thread/policy.yaml",
+        "ruff format tests",
+        "ruff format",
+        "ruff check --fix tests/acceptance/test_gate.py",
+        "ruff check --fix-only .thread/policy.yaml",
+        "ruff check --unsafe-fixes tests/acceptance/test_gate.py",
+        "ruff --fix tests/acceptance/test_gate.py",
+        "python -m ruff format tests/acceptance/test_gate.py",
+        "python -m ruff check --fix .thread/policy.yaml",
+    ):
+        with pytest.raises(ScopeViolationError):
+            be.enforce_shell(bad_ruff)
+
+    with pytest.raises(ScopeViolationError):
+        ro.enforce_shell("ruff format app/main.py")
+    with pytest.raises(ScopeViolationError):
+        ro.enforce_shell("ruff check --fix app/main.py")
+
+    assert be.enforce_shell("ruff format app/main.py")
+    assert be.enforce_shell("ruff check --fix --config pyproject.toml app/main.py")
+    assert be.enforce_shell("ruff check .")
+    assert be.enforce_shell("ruff check --output-format=json tests/acceptance/test_gate.py")
+
+
+def test_read_tools_nested_dirs_file_uri_and_sdk_permission_request_url(tmp_path: Path) -> None:
+    """Verify nested search_path/root/cwd, file:// vs https:// URI containment, and PermissionRequestUrl denial."""
+    from copilot.generated.session_events import PermissionRequestUrl
+
+    wt = tmp_path / "wt"
+    (wt / "app").mkdir(parents=True)
+    (wt / "app" / "main.py").write_text("x = 1\n", encoding="utf-8")
+
+    be = RolePolicy(
+        role="backend",
+        worktree_root=wt,
+        allowed_paths=["app/**", "tests/**"],
+        denied_paths=[".thread/policy.yaml"],
+    )
+    ro = RolePolicy.from_scope_config("reviewer_readonly", ScopeConfig(), wt)
+
+    for policy in (be, ro):
+        with pytest.raises(ScopeViolationError):
+            policy.enforce_tool_call("grep", {"options": {"search_path": "/etc"}})
+        with pytest.raises(ScopeViolationError):
+            policy.enforce_tool_call("find", {"nested": {"root": "/etc"}})
+        with pytest.raises(ScopeViolationError):
+            policy.enforce_tool_call("search", {"options": {"cwd": "/etc"}})
+        with pytest.raises(ScopeViolationError):
+            policy.enforce_tool_call("read_file", {"uri": "file:///etc/passwd"})
+        with pytest.raises(ScopeViolationError):
+            policy.enforce_tool_call("read_file", {"uri": "https://evil.example.com/secret"})
+
+    # In-scope nested search_path and worktree file:// URI remain allowed for reads
+    be.enforce_tool_call("grep", {"options": {"search_path": "app"}})
+    be.enforce_tool_call("read_file", {"uri": (wt / "app" / "main.py").as_uri()})
+    ro.enforce_tool_call("read_file", {"uri": (wt / "app" / "main.py").as_uri()})
+
+    # SDK PermissionRequestUrl must fail closed (never approve-once)
+    sdk = CopilotSdkAdapter(be)
+    url_req = PermissionRequestUrl(
+        intention="fetch external documentation",
+        url="https://evil.example.com/exfil",
+    )
+    url_dec = asyncio.run(sdk._on_permission_request(url_req))
+    assert getattr(url_dec, "kind", None) == "denied-by-rules"
+
+    dict_url_dec = asyncio.run(
+        sdk._on_permission_request({"kind": "url", "url": "https://evil.example.com/exfil"})
+    )
+    assert dict_url_dec["kind"] == "denied-by-rules"

@@ -9,6 +9,8 @@ import shlex
 import sys
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
+from urllib.parse import urlsplit
+from urllib.request import url2pathname
 
 from thread_sdlc.config.models import RoleScope, ScopeConfig
 
@@ -164,9 +166,48 @@ _PATH_ARG_KEYS = (
     "newPath",
     "directory",
     "dir",
+    "uri",
 )
 
 _PATH_LIST_KEYS = frozenset({"paths", "files", "file_paths", "filePaths", "targets"})
+
+_READ_EXTRA_PATH_KEYS = frozenset(
+    {
+        "cwd",
+        "working_directory",
+        "workingDirectory",
+        "search_path",
+        "SearchPath",
+        "root",
+    }
+)
+
+_COVERAGE_OUTPUT_FLAGS = frozenset({"-d", "--directory", "-o", "--output", "--data-file"})
+
+_RUFF_VALUE_FLAGS = frozenset(
+    {
+        "--config",
+        "--select",
+        "--extend-select",
+        "--ignore",
+        "--extend-ignore",
+        "--fixable",
+        "--unfixable",
+        "--extend-fixable",
+        "--exclude",
+        "--extend-exclude",
+        "--per-file-ignores",
+        "--extend-per-file-ignores",
+        "--target-version",
+        "--line-length",
+        "--output-format",
+        "--output-file",
+        "-o",
+        "--cache-dir",
+        "--stdin-filename",
+        "--extension",
+    }
+)
 
 _FILE_WRITING_FLAGS = frozenset(
     {
@@ -398,13 +439,34 @@ class RolePolicy:
     def _resolve_and_check_containment(
         self, target_path: str | Path, operation: Literal["write", "read"]
     ) -> tuple[Path, str]:
-        raw = str(target_path).strip()
+        orig_raw = str(target_path).strip()
+        raw = orig_raw
         if not raw:
-            raise ScopeViolationError(self.role, operation, raw, "Empty target path")
+            raise ScopeViolationError(self.role, operation, orig_raw, "Empty target path")
         if "\x00" in raw:
-            raise ScopeViolationError(self.role, operation, raw, "Null byte in target path")
-        if "://" in raw:
-            raise ScopeViolationError(self.role, operation, raw, "URI paths are not permitted")
+            raise ScopeViolationError(self.role, operation, orig_raw, "Null byte in target path")
+        if "://" in raw or raw.lower().startswith("file:"):
+            parsed = urlsplit(raw)
+            if parsed.scheme.lower() != "file":
+                raise ScopeViolationError(
+                    self.role, operation, orig_raw, "URI paths are not permitted"
+                )
+            if parsed.netloc and parsed.netloc.lower() != "localhost":
+                raise ScopeViolationError(
+                    self.role, operation, orig_raw, "Remote file URI hosts are not permitted"
+                )
+            if parsed.query or parsed.fragment:
+                raise ScopeViolationError(
+                    self.role,
+                    operation,
+                    orig_raw,
+                    "File URI query or fragment components are not permitted",
+                )
+            raw = url2pathname(parsed.path)
+            if not raw:
+                raise ScopeViolationError(
+                    self.role, operation, orig_raw, "Empty file URI path"
+                )
 
         p = Path(raw)
         candidate = p if p.is_absolute() else (self.worktree_root / p)
@@ -419,7 +481,7 @@ class RolePolicy:
                     raise ScopeViolationError(
                         self.role,
                         operation,
-                        raw,
+                        orig_raw,
                         "Symlink escapes worktree root",
                     ) from exc
             if (
@@ -435,7 +497,7 @@ class RolePolicy:
             rel = resolved.relative_to(self.worktree_root)
         except ValueError as exc:
             raise ScopeViolationError(
-                self.role, operation, raw, "Path escapes worktree root"
+                self.role, operation, orig_raw, "Path escapes worktree root"
             ) from exc
 
         rel_posix = rel.as_posix()
@@ -597,12 +659,16 @@ class RolePolicy:
 
         # Restrict inline code execution flags and `-m <module>` for python across all roles
         python_module: str | None = None
+        python_module_end_idx: int | None = None
+        cov_nested_module: str | None = None
+        cov_nested_end_idx: int | None = None
         if exe_lower == "python" or exe_lower.startswith("python3") or exe_lower.startswith("python2"):
             skip_next_py = False
             expect_py_module = False
-            for tok in tokens[1:]:
+            for idx, tok in enumerate(tokens[1:], start=1):
                 if expect_py_module:
                     python_module = tok
+                    python_module_end_idx = idx
                     if python_module not in _ALLOWED_PYTHON_MODULES:
                         raise ScopeViolationError(
                             self.role,
@@ -637,6 +703,7 @@ class RolePolicy:
                         mod_rest = tok[m_idx + 1 :]
                         if mod_rest:
                             python_module = mod_rest
+                            python_module_end_idx = idx
                             if python_module not in _ALLOWED_PYTHON_MODULES:
                                 raise ScopeViolationError(
                                     self.role,
@@ -654,6 +721,168 @@ class RolePolicy:
                     command,
                     "Missing module name after 'python -m'",
                 )
+
+            if python_module == "coverage" and python_module_end_idx is not None:
+                cov_subcmd: str | None = None
+                cov_subcmd_idx: int | None = None
+                skip_next_cov = False
+                for idx in range(python_module_end_idx + 1, len(tokens)):
+                    tok = tokens[idx]
+                    if skip_next_cov:
+                        skip_next_cov = False
+                        continue
+                    if tok in ("--rcfile", "--debug"):
+                        skip_next_cov = True
+                        continue
+                    if tok.startswith("--"):
+                        if tok in ("--command",) or tok.startswith("--command="):
+                            raise ScopeViolationError(
+                                self.role,
+                                "shell",
+                                command,
+                                "Inline code execution in 'python -m coverage' is disallowed",
+                            )
+                        continue
+                    if tok.startswith("-"):
+                        if "c" in tok[1:]:
+                            raise ScopeViolationError(
+                                self.role,
+                                "shell",
+                                command,
+                                "Inline '-c' code execution in 'python -m coverage' is disallowed",
+                            )
+                        continue
+                    cov_subcmd = tok
+                    cov_subcmd_idx = idx
+                    break
+
+                if cov_subcmd == "run" and cov_subcmd_idx is not None:
+                    skip_next_run = False
+                    expect_cov_mod = False
+                    for idx in range(cov_subcmd_idx + 1, len(tokens)):
+                        tok = tokens[idx]
+                        if expect_cov_mod:
+                            cov_nested_module = tok
+                            cov_nested_end_idx = idx
+                            if (
+                                cov_nested_module not in _ALLOWED_PYTHON_MODULES
+                                or cov_nested_module == "coverage"
+                            ):
+                                raise ScopeViolationError(
+                                    self.role,
+                                    "shell",
+                                    command,
+                                    f"Nested coverage module {cov_nested_module!r} is not in allowed_python_modules {sorted(_ALLOWED_PYTHON_MODULES - {'coverage'})}",
+                                )
+                            expect_cov_mod = False
+                            break
+                        if skip_next_run:
+                            skip_next_run = False
+                            continue
+                        if tok == "--":
+                            continue
+                        if tok in (
+                            "--data-file",
+                            "--rcfile",
+                            "--source",
+                            "--include",
+                            "--omit",
+                            "--concurrency",
+                            "--context",
+                            "--debug",
+                        ):
+                            skip_next_run = True
+                            continue
+                        if tok in ("-m", "--module"):
+                            expect_cov_mod = True
+                            continue
+                        if tok.startswith("--module="):
+                            cov_nested_module = tok.split("=", 1)[1]
+                            cov_nested_end_idx = idx
+                            if (
+                                not cov_nested_module
+                                or cov_nested_module not in _ALLOWED_PYTHON_MODULES
+                                or cov_nested_module == "coverage"
+                            ):
+                                raise ScopeViolationError(
+                                    self.role,
+                                    "shell",
+                                    command,
+                                    f"Nested coverage module {cov_nested_module!r} is not in allowed_python_modules {sorted(_ALLOWED_PYTHON_MODULES - {'coverage'})}",
+                                )
+                            break
+                        if tok in ("--command",) or tok.startswith("--command="):
+                            raise ScopeViolationError(
+                                self.role,
+                                "shell",
+                                command,
+                                "Inline code execution in 'python -m coverage run' is disallowed",
+                            )
+                        if tok.startswith("-") and not tok.startswith("--"):
+                            if "c" in tok[1:]:
+                                raise ScopeViolationError(
+                                    self.role,
+                                    "shell",
+                                    command,
+                                    "Inline '-c' code execution in 'python -m coverage run' is disallowed",
+                                )
+                            if "m" in tok[1:]:
+                                m_idx = tok.index("m", 1)
+                                mod_rest = tok[m_idx + 1 :]
+                                if mod_rest:
+                                    cov_nested_module = mod_rest
+                                    cov_nested_end_idx = idx
+                                    if (
+                                        cov_nested_module not in _ALLOWED_PYTHON_MODULES
+                                        or cov_nested_module == "coverage"
+                                    ):
+                                        raise ScopeViolationError(
+                                            self.role,
+                                            "shell",
+                                            command,
+                                            f"Nested coverage module {cov_nested_module!r} is not in allowed_python_modules {sorted(_ALLOWED_PYTHON_MODULES - {'coverage'})}",
+                                        )
+                                    break
+                                expect_cov_mod = True
+                                continue
+                    if expect_cov_mod:
+                        raise ScopeViolationError(
+                            self.role,
+                            "shell",
+                            command,
+                            "Missing module name after 'coverage run -m'",
+                        )
+
+        is_pytest = (
+            exe_lower == "pytest"
+            or python_module == "pytest"
+            or cov_nested_module == "pytest"
+        )
+        is_coverage = python_module == "coverage"
+        is_ruff = (
+            exe_lower == "ruff"
+            or python_module == "ruff"
+            or cov_nested_module == "ruff"
+        )
+        ruff_tokens: list[str] = []
+        if is_ruff:
+            if exe_lower == "ruff":
+                ruff_tokens = tokens[1:]
+            elif python_module == "ruff" and python_module_end_idx is not None:
+                ruff_tokens = tokens[python_module_end_idx + 1 :]
+            elif cov_nested_module == "ruff" and cov_nested_end_idx is not None:
+                ruff_tokens = tokens[cov_nested_end_idx + 1 :]
+
+        ruff_subcmd = next((t for t in ruff_tokens if not t.startswith("-")), None) if is_ruff else None
+        has_ruff_fix_flag = False
+        if is_ruff:
+            for rt in ruff_tokens:
+                if rt == "--":
+                    break
+                if rt in ("--fix", "--fix-only", "--unsafe-fixes"):
+                    has_ruff_fix_flag = True
+                    break
+        is_ruff_mutating = is_ruff and (ruff_subcmd == "format" or has_ruff_fix_flag)
 
         if exe_lower in ("node", "nodejs"):
             skip_next_node = False
@@ -697,6 +926,10 @@ class RolePolicy:
                 raise ScopeViolationError(
                     self.role, "shell", command, "Read-only role cannot run 'sed -i'"
                 )
+            if is_ruff_mutating:
+                raise ScopeViolationError(
+                    self.role, "shell", command, "Read-only role cannot run mutating ruff command"
+                )
             for t in tokens[1:]:
                 t_flag = t.split("=", 1)[0]
                 if (
@@ -705,6 +938,14 @@ class RolePolicy:
                     or t.startswith("--ext-diff=")
                     or t == "-o"
                     or (t.startswith("-o") and not t.startswith("--"))
+                    or (is_pytest and (t == "--override-ini" or t.startswith("--override-ini=")))
+                    or (
+                        is_coverage
+                        and (
+                            t_flag in _COVERAGE_OUTPUT_FLAGS
+                            or (t.startswith(("-d", "-o")) and not t.startswith("--"))
+                        )
+                    )
                 ):
                     raise ScopeViolationError(
                         self.role,
@@ -739,11 +980,18 @@ class RolePolicy:
             )
 
         # Ensure file-writing flags (both `--flag=path` and `--flag path`) and path-like tokens stay in scope
-        is_pytest = exe_lower == "pytest" or python_module == "pytest"
         expect_write_flag: str | None = None
         expect_pytest_ini = False
 
-        for tok in tokens[1:]:
+        for idx, tok in enumerate(tokens[1:], start=1):
+            in_cov_prefix = (
+                is_coverage
+                and python_module_end_idx is not None
+                and idx > python_module_end_idx
+                and (cov_nested_end_idx is None or idx <= cov_nested_end_idx)
+            )
+            cov_flag_active = in_cov_prefix or (is_coverage and cov_nested_module is None)
+
             if expect_write_flag is not None:
                 flag_used = expect_write_flag
                 expect_write_flag = None
@@ -762,7 +1010,11 @@ class RolePolicy:
                 self._check_pytest_override_ini(tok, command)
                 continue
 
-            if tok in _FILE_WRITING_FLAGS or (not is_pytest and tok == "-o"):
+            if (
+                tok in _FILE_WRITING_FLAGS
+                or (not is_pytest and tok == "-o")
+                or (cov_flag_active and tok in _COVERAGE_OUTPUT_FLAGS)
+            ):
                 if self.readonly:
                     raise ScopeViolationError(
                         self.role,
@@ -773,14 +1025,71 @@ class RolePolicy:
                 expect_write_flag = tok
                 continue
 
-            if is_pytest and tok == "-o":
+            if is_pytest and tok in ("-o", "--override-ini"):
+                if self.readonly:
+                    raise ScopeViolationError(
+                        self.role,
+                        "shell",
+                        command,
+                        f"Read-only role cannot use pytest override flag {tok!r}",
+                    )
                 expect_pytest_ini = True
                 continue
 
             if tok.startswith("-"):
+                # Glued short flags (`-o<val>`, `-d<val>`) must be checked BEFORE `if "=" in tok:`
+                # so `-olog_file=.thread/policy.yaml` is never treated as `--flag=val`.
+                if (
+                    not tok.startswith("--")
+                    and tok.startswith("-o")
+                    and len(tok) > 2
+                    and not tok.startswith("-o=")
+                ):
+                    attached = tok[2:]
+                    if is_pytest and not in_cov_prefix:
+                        if self.readonly:
+                            raise ScopeViolationError(
+                                self.role,
+                                "shell",
+                                command,
+                                "Read-only role cannot override pytest ini via '-o'",
+                            )
+                        self._check_pytest_override_ini(attached, command)
+                    else:
+                        if self.readonly:
+                            raise ScopeViolationError(
+                                self.role,
+                                "shell",
+                                command,
+                                "Read-only role cannot use file-writing flag '-o'",
+                            )
+                        self.enforce_write(attached)
+                    continue
+
+                if (
+                    cov_flag_active
+                    and not tok.startswith("--")
+                    and tok.startswith("-d")
+                    and len(tok) > 2
+                    and not tok.startswith("-d=")
+                ):
+                    if self.readonly:
+                        raise ScopeViolationError(
+                            self.role,
+                            "shell",
+                            command,
+                            "Read-only role cannot use file-writing flag '-d'",
+                        )
+                    self.enforce_write(tok[2:])
+                    continue
+
                 if "=" in tok:
                     flag_name, flag_val = tok.split("=", 1)
-                    if flag_name in _FILE_WRITING_FLAGS or (not is_pytest and flag_name == "-o"):
+                    if (
+                        flag_name in _FILE_WRITING_FLAGS
+                        or ((not is_pytest or in_cov_prefix) and flag_name == "-o")
+                        or (cov_flag_active and flag_name in _COVERAGE_OUTPUT_FLAGS)
+                    ):
                         if self.readonly:
                             raise ScopeViolationError(
                                 self.role,
@@ -797,7 +1106,14 @@ class RolePolicy:
                             )
                         self.enforce_write(flag_val)
                         continue
-                    if is_pytest and flag_name == "--override-ini":
+                    if is_pytest and flag_name in ("--override-ini", "-o"):
+                        if self.readonly:
+                            raise ScopeViolationError(
+                                self.role,
+                                "shell",
+                                command,
+                                f"Read-only role cannot override pytest ini via {flag_name!r}",
+                            )
                         self._check_pytest_override_ini(flag_val, command)
                         continue
                     candidates = [flag_val]
@@ -809,20 +1125,6 @@ class RolePolicy:
                             if file_part:
                                 self._resolve_and_check_containment(file_part, "read")
                 elif len(tok) > 2 and not tok.startswith("--"):
-                    if tok.startswith("-o"):
-                        attached = tok[2:]
-                        if is_pytest:
-                            self._check_pytest_override_ini(attached, command)
-                        else:
-                            if self.readonly:
-                                raise ScopeViolationError(
-                                    self.role,
-                                    "shell",
-                                    command,
-                                    "Read-only role cannot use file-writing flag '-o'",
-                                )
-                            self.enforce_write(attached)
-                        continue
                     attached = tok[2:]
                     if "/" in attached or "\\" in attached or ".." in attached:
                         file_part = attached.split("::", 1)[0]
@@ -848,8 +1150,52 @@ class RolePolicy:
                 self.role,
                 "shell",
                 command,
-                "Missing value for pytest '-o' flag",
+                "Missing value for pytest '-o'/'--override-ini' flag",
             )
+
+        if is_ruff_mutating:
+            ruff_targets: list[str] = []
+            skip_ruff_val = False
+            saw_ruff_subcmd = False
+            after_double_dash = False
+            for rt in ruff_tokens:
+                if after_double_dash:
+                    ruff_targets.append(rt)
+                    continue
+                if skip_ruff_val:
+                    skip_ruff_val = False
+                    continue
+                if rt == "--":
+                    after_double_dash = True
+                    continue
+                if rt in _RUFF_VALUE_FLAGS:
+                    skip_ruff_val = True
+                    continue
+                if rt.startswith("-"):
+                    continue
+                if not saw_ruff_subcmd and rt in ("format", "check"):
+                    saw_ruff_subcmd = True
+                    continue
+                ruff_targets.append(rt)
+
+            if not ruff_targets:
+                ruff_targets = ["."]
+            for r_target in ruff_targets:
+                resolved_target = self.enforce_write(r_target)
+                rel_norm = (
+                    resolved_target.relative_to(self.worktree_root).as_posix().rstrip("/")
+                )
+                for pat in (*self.denied_paths, *self.deny_gate_files):
+                    pat_norm = "/".join(_normalize_pattern(pat))
+                    if pat_norm and (
+                        pat_norm == rel_norm or pat_norm.startswith(f"{rel_norm}/")
+                    ):
+                        raise ScopeViolationError(
+                            self.role,
+                            "shell",
+                            command,
+                            f"Mutating ruff target {r_target!r} covers protected/denied pattern {pat!r}",
+                        )
 
         return tokens
 
@@ -857,7 +1203,7 @@ class RolePolicy:
         if "=" in val:
             ini_key, ini_val = val.split("=", 1)
             key_lower = ini_key.strip().lower()
-            if key_lower in ("log_file", "cache_dir", "basetemp", "junit_logging", "resultlog"):
+            if key_lower in ("log_file", "cache_dir", "basetemp", "resultlog"):
                 if self.readonly:
                     raise ScopeViolationError(
                         self.role,
@@ -871,7 +1217,11 @@ class RolePolicy:
                 self._resolve_and_check_containment(ini_val.strip(), "read")
 
     def _extract_tool_paths(
-        self, args: dict[str, Any], *, include_patches: bool = True
+        self,
+        args: dict[str, Any],
+        *,
+        include_patches: bool = True,
+        extra_keys: frozenset[str] = frozenset(),
     ) -> list[str]:
         extracted: list[str] = []
 
@@ -890,7 +1240,7 @@ class RolePolicy:
         def _walk(node: Any) -> None:
             if isinstance(node, dict):
                 for key, val in node.items():
-                    if key in _PATH_ARG_KEYS:
+                    if key in _PATH_ARG_KEYS or key in extra_keys:
                         if isinstance(val, str) and val.strip():
                             extracted.append(val.strip())
                         elif isinstance(val, (list, tuple, dict)):
@@ -987,19 +1337,10 @@ class RolePolicy:
             return
 
         if norm_name in _READ_TOOLS:
-            for target in self._extract_tool_paths(args, include_patches=False):
-                self.enforce_read(target)
-            for cwd_key in (
-                "cwd",
-                "working_directory",
-                "workingDirectory",
-                "search_path",
-                "SearchPath",
-                "root",
+            for target in self._extract_tool_paths(
+                args, include_patches=False, extra_keys=_READ_EXTRA_PATH_KEYS
             ):
-                cwd_val = args.get(cwd_key)
-                if isinstance(cwd_val, str) and cwd_val.strip():
-                    self.enforce_read(cwd_val.strip())
+                self.enforce_read(target)
             return
 
         if norm_name in ("git_merge", "git_push", "merge", "push"):

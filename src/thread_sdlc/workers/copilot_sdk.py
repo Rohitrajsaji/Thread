@@ -260,6 +260,14 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
                         "Read permission request missing target path (fail closed)",
                     )
                 self._policy.enforce_read(target.strip())
+            elif kind == "url":
+                url = _extract_attr_or_key(request, "url", "uri") or "<unknown>"
+                raise ScopeViolationError(
+                    self._policy.role,
+                    "tool",
+                    str(url),
+                    "External URL permission requests are denied by Thread role policy (fail closed)",
+                )
             else:
                 tool_name = str(
                     _extract_attr_or_key(request, "tool_name", "toolName", "kind") or "unknown"

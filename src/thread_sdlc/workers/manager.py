@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -20,6 +21,7 @@ from thread_sdlc.workers.adapter import (
     WorkerAdapter,
     WorkerAssignment,
     WorkerEvent,
+    WorkerExecutionError,
 )
 from thread_sdlc.workers.permissions import RolePolicy
 from thread_sdlc.workers.worktree import ReconcileResult, WorktreeManager
@@ -385,6 +387,40 @@ class WorkerManager:
                 turns_delta=usage_now.turns_used,
             )
             raise
+        except asyncio.CancelledError as exc:
+            try:
+                await adapter.abort()
+            except Exception:
+                pass
+            finally:
+                usage_now = adapter.usage_metrics()
+                self.repo.update_assignment(
+                    asgn_id,
+                    status="failed",
+                    turns_used=usage_now.turns_used,
+                    credits_used=usage_now.credits_used,
+                    ended_at=utc_now_iso(),
+                )
+                self.repo.increment_thread_usage(
+                    thread_id,
+                    credits_delta=usage_now.credits_used,
+                    turns_delta=usage_now.turns_used,
+                )
+                self.repo.update_ticket(ticket_id, status="failed")
+                self.events.emit(
+                    thread_id,
+                    "assignment_failed",
+                    {
+                        "assignment_id": asgn_id,
+                        "ticket_id": ticket_id,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc) or "Worker execution cancelled",
+                        "aborted": True,
+                        "turns_used": usage_now.turns_used,
+                        "credits_used": usage_now.credits_used,
+                    },
+                )
+            raise
         except Exception as exc:
             usage_now = adapter.usage_metrics()
             self.repo.update_assignment(
@@ -422,6 +458,35 @@ class WorkerManager:
             asgn_id, worktree.path, base_sha=worktree.base_sha
         )
         result_sha = git_sha or committed_sha
+
+        if usage_final.aborted:
+            self.repo.update_assignment(
+                asgn_id,
+                status="failed",
+                turns_used=usage_final.turns_used,
+                credits_used=usage_final.credits_used,
+                ended_at=utc_now_iso(),
+            )
+            self.repo.increment_thread_usage(
+                thread_id,
+                credits_delta=usage_final.credits_used,
+                turns_delta=usage_final.turns_used,
+            )
+            self.repo.update_ticket(ticket_id, status="failed")
+            self.events.emit(
+                thread_id,
+                "assignment_failed",
+                {
+                    "assignment_id": asgn_id,
+                    "ticket_id": ticket_id,
+                    "error_type": "WorkerExecutionError",
+                    "error": "Worker execution aborted before completion",
+                    "aborted": True,
+                    "turns_used": usage_final.turns_used,
+                    "credits_used": usage_final.credits_used,
+                },
+            )
+            raise WorkerExecutionError("Worker execution aborted before completion")
 
         self.repo.update_assignment(
             asgn_id,

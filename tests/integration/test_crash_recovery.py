@@ -351,3 +351,119 @@ def test_pre_commit_failure_marks_failed_allows_retry_and_enforces_retry_limit(
 
     with pytest.raises(WorkerRetryLimitError):
         asyncio.run(mgr_bad.dispatch_ticket("thr-fail", "T-F3", "exceeded retries"))
+
+
+def test_cancelled_dispatch_releases_concurrency_slot_and_allows_subsequent_ticket(
+    tmp_path: Path,
+) -> None:
+    """Cancelling dispatch_ticket mid-stream aborts adapter, marks failed, and releases slot."""
+    repo, base_sha = _setup_repo(tmp_path)
+    db = StateDatabase(repo_root=repo)
+    sr = StateRepository(db)
+    sr.create_thread(ThreadRecord(id="thr-cancel", title="Cancel", base_sha=base_sha))
+    sr.create_ticket(TicketRecord(id="T-C1", thread_id="thr-cancel", title="C1", role="backend"))
+    sr.create_ticket(TicketRecord(id="T-C2", thread_id="thr-cancel", title="C2", role="backend"))
+
+    policy = PolicyConfig()
+    policy.caps.max_workers_per_thread = 1
+    created_slow: list[MockWorkerAdapter] = []
+
+    def _slow_factory(pol: RolePolicy) -> MockWorkerAdapter:
+        ad = MockWorkerAdapter(pol, scenario="slow_for_abort", abort_wait_seconds=30.0)
+        created_slow.append(ad)
+        return ad
+
+    mgr_slow = WorkerManager(
+        repo_root=repo,
+        db=db,
+        policy=policy,
+        scope=ScopeConfig(),
+        adapter_factory=_slow_factory,
+    )
+
+    async def _run_and_cancel() -> None:
+        task = asyncio.create_task(
+            mgr_slow.dispatch_ticket("thr-cancel", "T-C1", "long run", assignment_id="asgn-cancel")
+        )
+        while not created_slow or created_slow[0].start_count == 0:
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.02)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_run_and_cancel())
+
+    assert len(created_slow) == 1
+    assert created_slow[0].abort_count == 1
+    asgn = sr.get_assignment("asgn-cancel")
+    assert asgn is not None
+    assert asgn.status == "failed"
+    assert asgn.ended_at is not None
+    assert sr.get_ticket("T-C1").status == "failed"
+    assert sr.count_active_assignments("thr-cancel") == 0
+    assert any(e.type == "assignment_failed" for e in mgr_slow.events.list_events("thr-cancel"))
+
+    # Subsequent ticket on the same thread succeeds without WorkerConcurrencyError
+    mgr_ok = WorkerManager(
+        repo_root=repo,
+        db=db,
+        policy=policy,
+        scope=ScopeConfig(),
+        adapter_factory=lambda pol: MockWorkerAdapter(pol, scenario="commit_success"),
+    )
+    ok_res = asyncio.run(mgr_ok.dispatch_ticket("thr-cancel", "T-C2", "next ticket"))
+    assert ok_res.status == "completed"
+    assert ok_res.result_sha is not None
+
+
+def test_external_abort_marks_failed_instead_of_completed(tmp_path: Path) -> None:
+    """External adapter.abort() mid-stream must mark failed and raise WorkerExecutionError, never done."""
+    repo, base_sha = _setup_repo(tmp_path)
+    db = StateDatabase(repo_root=repo)
+    sr = StateRepository(db)
+    sr.create_thread(ThreadRecord(id="thr-ext-abort", title="Ext Abort", base_sha=base_sha))
+    sr.create_ticket(
+        TicketRecord(id="T-A1", thread_id="thr-ext-abort", title="A1", role="backend")
+    )
+
+    created: list[MockWorkerAdapter] = []
+
+    def _slow_factory(pol: RolePolicy) -> MockWorkerAdapter:
+        ad = MockWorkerAdapter(pol, scenario="slow_for_abort", abort_wait_seconds=30.0)
+        created.append(ad)
+        return ad
+
+    mgr = WorkerManager(
+        repo_root=repo,
+        db=db,
+        policy=PolicyConfig(),
+        scope=ScopeConfig(),
+        adapter_factory=_slow_factory,
+    )
+
+    async def _run_and_abort() -> None:
+        task = asyncio.create_task(
+            mgr.dispatch_ticket(
+                "thr-ext-abort", "T-A1", "wait", assignment_id="asgn-ext-abort"
+            )
+        )
+        while not created or created[0].start_count == 0:
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.02)
+        await created[0].abort()
+        with pytest.raises(WorkerExecutionError, match="aborted before completion"):
+            await task
+
+    asyncio.run(_run_and_abort())
+
+    asgn = sr.get_assignment("asgn-ext-abort")
+    assert asgn is not None
+    assert asgn.status == "failed"
+    assert asgn.result_sha is None
+    assert asgn.ended_at is not None
+    assert sr.get_ticket("T-A1").status == "failed"
+    assert sr.count_active_assignments("thr-ext-abort") == 0
+    events = mgr.events.list_events("thr-ext-abort")
+    assert any(e.type == "assignment_failed" for e in events)
+    assert not any(e.type == "assignment_completed" for e in events)
