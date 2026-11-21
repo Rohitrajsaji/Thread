@@ -273,18 +273,45 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
             )
             return cwd_str, resolved_cwd
 
-        cwd_candidates: dict[str, Any] = {}
-        for cwd_key in _SHELL_CWD_KEYS:
-            if hasattr(request, cwd_key):
-                val = getattr(request, cwd_key)
-                if val is not None:
-                    cwd_candidates[cwd_key] = val
-        if not cwd_candidates:
+        def _to_mapping_tree(obj: Any, seen: set[int]) -> Any:
+            if isinstance(obj, Mapping):
+                return {k: _to_mapping_tree(v, seen) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                return [_to_mapping_tree(item, seen) for item in obj]
+            if obj is None or isinstance(obj, (str, bytes, int, float, bool, Path)):
+                return obj
+            obj_id = id(obj)
+            if obj_id in seen:
+                return None
+            seen.add(obj_id)
+            out: dict[str, Any] = {}
+            for key in _SHELL_CWD_KEYS:
+                if hasattr(obj, key):
+                    val = getattr(obj, key)
+                    if val is not None:
+                        out[key] = _to_mapping_tree(val, seen)
+            for container_attr in (
+                "options",
+                "params",
+                "args",
+                "toolArgs",
+                "tool_args",
+                "arguments",
+                "input",
+                "items",
+            ):
+                if hasattr(obj, container_attr):
+                    val = getattr(obj, container_attr)
+                    if val is not None:
+                        out[container_attr] = _to_mapping_tree(val, seen)
+            return out
+
+        collected = _to_mapping_tree(request, set())
+        if not collected:
             return None, self._policy.worktree_root
-        cwd_str = self._policy._validate_shell_cwd_mapping(cwd_candidates, label)
-        if cwd_str is None:
-            return None, self._policy.worktree_root
-        resolved_cwd, _ = self._policy._resolve_shell_cwd(cwd_str, label)
+        cwd_str, resolved_cwd, _ = self._policy._extract_and_validate_cwds(
+            collected, label
+        )
         return cwd_str, resolved_cwd
 
     async def _on_permission_request(
@@ -433,22 +460,8 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
                     request, "full_command_text", "fullCommandText", "command"
                 )
                 cmd_label = cmd if isinstance(cmd, str) and cmd.strip() else "<unknown>"
-                cwd_candidates: dict[str, Any] = {}
-                for cwd_key in _SHELL_CWD_KEYS:
-                    if isinstance(request, dict):
-                        if cwd_key in request and request[cwd_key] is not None:
-                            cwd_candidates[cwd_key] = request[cwd_key]
-                    elif hasattr(request, cwd_key):
-                        val = getattr(request, cwd_key)
-                        if val is not None:
-                            cwd_candidates[cwd_key] = val
-                cwd_for_shell = self._policy._validate_shell_cwd_mapping(
-                    cwd_candidates, cmd_label
-                )
-                resolved_cwd = (
-                    self._policy.enforce_read(cwd_for_shell)
-                    if cwd_for_shell is not None
-                    else None
+                cwd_for_shell, resolved_cwd = self._resolve_request_cwd(
+                    request, cmd_label
                 )
 
                 has_redir = bool(

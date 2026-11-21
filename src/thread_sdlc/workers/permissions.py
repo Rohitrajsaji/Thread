@@ -6,6 +6,7 @@ import configparser
 import fnmatch
 import json
 import os
+import re
 import shlex
 import sys
 import tomllib
@@ -143,6 +144,8 @@ _PATH_ARG_KEYS = (
     "targetPath",
     "target_file",
     "TargetFile",
+    "target_file_path",
+    "targetFilePath",
     "target",
     "link",
     "link_path",
@@ -158,6 +161,11 @@ _PATH_ARG_KEYS = (
     "filename",
     "file",
     "file_name",
+    "fileName",
+    "old_file_name",
+    "oldFileName",
+    "new_file_name",
+    "newFileName",
     "resolved_path",
     "resolvedPath",
     "destination",
@@ -181,6 +189,8 @@ _PATH_LIST_KEYS = frozenset(
         "files",
         "file_paths",
         "filePaths",
+        "file_names",
+        "fileNames",
         "targets",
         "roots",
         "directories",
@@ -343,6 +353,31 @@ _SHELL_CWD_KEYS = (
     "resolved_working_directory",
     "resolvedWorkingDirectory",
 )
+
+_SHELL_NAME_TOKENS = frozenset(
+    {
+        "bash",
+        "shell",
+        "sh",
+        "zsh",
+        "powershell",
+        "pwsh",
+        "exec",
+        "execute",
+        "terminal",
+        "command",
+        "cmd",
+        "cli",
+        "spawn",
+        "process",
+    }
+)
+
+
+def _split_tool_name_tokens(tool_name: str) -> list[str]:
+    split_acronyms = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", tool_name)
+    split_camel = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", split_acronyms)
+    return re.findall(r"[a-z0-9]+", split_camel.lower())
 
 
 class ScopeViolationError(Exception):
@@ -986,7 +1021,96 @@ class RolePolicy:
 
         # Prevent git merge / push / rebase / worktree and external repo flags
         if exe_lower == "git":
+            _dangerous_git_config_keys = frozenset(
+                {
+                    "core.fsmonitor",
+                    "core.hookspath",
+                    "core.sshcommand",
+                    "core.gitproxy",
+                    "core.pager",
+                    "core.editor",
+                    "core.askpass",
+                    "core.attributesfile",
+                    "core.excludesfile",
+                    "core.alternaterefscommand",
+                    "diff.external",
+                    "diff.tool",
+                    "merge.tool",
+                    "credential.helper",
+                    "uploadpack.packobjectshook",
+                    "gpg.program",
+                    "gpg.ssh.program",
+                    "sequence.editor",
+                    "web.browser",
+                    "safe.directory",
+                    "init.templatedir",
+                    "protocol.ext.allow",
+                    "protocol.file.allow",
+                    "protocol.allow",
+                }
+            )
+            _dangerous_git_config_prefixes = (
+                "alias.",
+                "filter.",
+                "pager.",
+                "remote.",
+                "url.",
+                "include.",
+                "includeif.",
+                "credential.",
+                "difftool.",
+                "mergetool.",
+                "browser.",
+            )
+            subcmd: str | None = None
+            expect_global_opt: str | None = None
             expect_git_output = False
+            git_cwd = effective_cwd
+            git_target_dirs: list[Path] = []
+
+            def _validate_git_config_override(
+                cfg_spec: str, *, is_config_env: bool = False
+            ) -> None:
+                if self.readonly:
+                    raise ScopeViolationError(
+                        self.role,
+                        "shell",
+                        command,
+                        "Read-only role cannot use git config override '-c'/'--config-env'",
+                    )
+                if not cfg_spec.strip():
+                    raise ScopeViolationError(
+                        self.role,
+                        "shell",
+                        command,
+                        "Empty git config override (fail closed)",
+                    )
+                cfg_key, has_eq, cfg_val = cfg_spec.partition("=")
+                key_lower = cfg_key.strip().lower()
+                if not key_lower:
+                    raise ScopeViolationError(
+                        self.role,
+                        "shell",
+                        command,
+                        f"Malformed git config override {cfg_spec!r}",
+                    )
+                if key_lower in _dangerous_git_config_keys or key_lower.startswith(
+                    _dangerous_git_config_prefixes
+                ):
+                    raise ScopeViolationError(
+                        self.role,
+                        "shell",
+                        command,
+                        f"Dangerous git config override {cfg_key!r} is disallowed",
+                    )
+                if not is_config_env and has_eq and cfg_val.lstrip().startswith("!"):
+                    raise ScopeViolationError(
+                        self.role,
+                        "shell",
+                        command,
+                        f"Git config override {cfg_key!r} with '!' command execution is disallowed",
+                    )
+
             for i, tok in enumerate(tokens[1:], start=1):
                 if expect_git_output:
                     expect_git_output = False
@@ -997,20 +1121,81 @@ class RolePolicy:
                             command,
                             "Read-only role cannot use file-writing git flag '--output'",
                         )
-                    self.enforce_write(tok, base_dir=effective_cwd)
+                    self.enforce_write(tok, base_dir=git_cwd)
                     continue
-                if tok == "-C" and i + 1 < len(tokens):
-                    self.enforce_read(tokens[i + 1], base_dir=effective_cwd)
-                elif tok.startswith("-C") and len(tok) > 2:
-                    self.enforce_read(tok[2:], base_dir=effective_cwd)
-                elif tok.startswith("--git-dir=") or tok.startswith("--work-tree="):
-                    _, val = tok.split("=", 1)
-                    self.enforce_read(val, base_dir=effective_cwd)
-                elif tok in ("--git-dir", "--work-tree"):
-                    raise ScopeViolationError(
-                        self.role, "shell", command, f"Flag {tok!r} is disallowed"
-                    )
-                elif tok == "--output":
+
+                if subcmd is None:
+                    if expect_global_opt is not None:
+                        opt_used = expect_global_opt
+                        expect_global_opt = None
+                        if opt_used == "-C":
+                            git_cwd = self.enforce_read(tok, base_dir=git_cwd)
+                            git_target_dirs.append(git_cwd)
+                        elif opt_used == "--git-dir":
+                            self.enforce_read(tok, base_dir=effective_cwd)
+                        elif opt_used == "--work-tree":
+                            wt_dir = self.enforce_read(tok, base_dir=effective_cwd)
+                            git_target_dirs.append(wt_dir)
+                        elif opt_used == "-c":
+                            _validate_git_config_override(tok)
+                        elif opt_used == "--config-env":
+                            _validate_git_config_override(tok, is_config_env=True)
+                        # --namespace, --super-prefix, --attr-source take a value and are skipped
+                        continue
+
+                    if tok == "--":
+                        break
+                    if tok == "-C":
+                        expect_global_opt = "-C"
+                        continue
+                    if tok.startswith("-C") and len(tok) > 2:
+                        git_cwd = self.enforce_read(tok[2:], base_dir=git_cwd)
+                        git_target_dirs.append(git_cwd)
+                        continue
+                    if tok == "-c":
+                        expect_global_opt = "-c"
+                        continue
+                    if tok.startswith("-c") and len(tok) > 2:
+                        _validate_git_config_override(tok[2:])
+                        continue
+                    if tok in (
+                        "--git-dir",
+                        "--work-tree",
+                        "--namespace",
+                        "--super-prefix",
+                        "--config-env",
+                        "--attr-source",
+                    ):
+                        expect_global_opt = tok
+                        continue
+                    if tok.startswith("--git-dir="):
+                        _, val = tok.split("=", 1)
+                        self.enforce_read(val, base_dir=effective_cwd)
+                        continue
+                    if tok.startswith("--work-tree="):
+                        _, val = tok.split("=", 1)
+                        wt_dir = self.enforce_read(val, base_dir=effective_cwd)
+                        git_target_dirs.append(wt_dir)
+                        continue
+                    if tok.startswith("--config-env="):
+                        _, val = tok.split("=", 1)
+                        _validate_git_config_override(val, is_config_env=True)
+                        continue
+                    if tok.startswith(
+                        (
+                            "--namespace=",
+                            "--super-prefix=",
+                            "--attr-source=",
+                            "--exec-path=",
+                            "--list-cmds=",
+                        )
+                    ):
+                        continue
+                    if not tok.startswith("-"):
+                        subcmd = tok
+                        continue
+
+                if tok == "--output":
                     if self.readonly:
                         raise ScopeViolationError(
                             self.role,
@@ -1032,7 +1217,7 @@ class RolePolicy:
                             "Read-only role cannot use file-writing git flag '--output'",
                         )
                     _, out_val = tok.split("=", 1)
-                    self.enforce_write(out_val, base_dir=effective_cwd)
+                    self.enforce_write(out_val, base_dir=git_cwd)
                 elif tok == "--ext-diff" or tok.startswith("--ext-diff="):
                     if self.readonly:
                         raise ScopeViolationError(
@@ -1042,21 +1227,42 @@ class RolePolicy:
                             "Read-only role cannot use git '--ext-diff' flag",
                         )
 
-            subcmd = next((t for t in tokens[1:] if not t.startswith("-")), None)
-            if subcmd in _FORBIDDEN_GIT_SUBCOMMANDS:
+            if expect_global_opt is not None:
+                raise ScopeViolationError(
+                    self.role,
+                    "shell",
+                    command,
+                    f"Missing value for git global option {expect_global_opt!r}",
+                )
+
+            subcmd_lower = subcmd.lower() if subcmd is not None else None
+            if subcmd_lower in _FORBIDDEN_GIT_SUBCOMMANDS:
                 raise ScopeViolationError(
                     self.role,
                     "shell",
                     command,
                     f"Git subcommand 'git {subcmd}' is forbidden for workers",
                 )
-            if self.readonly and subcmd in _READONLY_MUTATING_GIT_SUBCOMMANDS:
+            if self.readonly and subcmd_lower in _READONLY_MUTATING_GIT_SUBCOMMANDS:
                 raise ScopeViolationError(
                     self.role,
                     "shell",
                     command,
                     f"Read-only role cannot execute mutating git command 'git {subcmd}'",
                 )
+            if subcmd_lower in _READONLY_MUTATING_GIT_SUBCOMMANDS:
+                for gdir in git_target_dirs:
+                    rel_gdir = gdir.relative_to(self.worktree_root).as_posix()
+                    if rel_gdir != "." and any(
+                        glob_match(rel_gdir, pat)
+                        for pat in (*self.denied_paths, *self.deny_gate_files)
+                    ):
+                        raise ScopeViolationError(
+                            self.role,
+                            "shell",
+                            command,
+                            f"Mutating git command 'git {subcmd}' targets denied directory {rel_gdir!r}",
+                        )
 
         # Restrict inline code execution flags and `-m <module>` for python across all roles
         python_module: str | None = None
@@ -1065,7 +1271,28 @@ class RolePolicy:
         cov_nested_end_idx: int | None = None
         if exe_lower == "python" or exe_lower.startswith("python3") or exe_lower.startswith("python2"):
             skip_next_py = False
+            expect_py_x = False
             expect_py_module = False
+
+            def _validate_python_x_opt(x_val: str) -> None:
+                if x_val.lower().startswith("pycache_prefix="):
+                    if self.readonly:
+                        raise ScopeViolationError(
+                            self.role,
+                            "shell",
+                            command,
+                            "Read-only role cannot set Python '-X pycache_prefix'",
+                        )
+                    prefix_path = x_val.split("=", 1)[1]
+                    if not prefix_path.strip():
+                        raise ScopeViolationError(
+                            self.role,
+                            "shell",
+                            command,
+                            "Empty path for Python '-X pycache_prefix'",
+                        )
+                    self.enforce_write(prefix_path, base_dir=effective_cwd)
+
             for idx, tok in enumerate(tokens[1:], start=1):
                 if expect_py_module:
                     python_module = tok
@@ -1079,42 +1306,74 @@ class RolePolicy:
                         )
                     expect_py_module = False
                     break
+                if expect_py_x:
+                    expect_py_x = False
+                    _validate_python_x_opt(tok)
+                    continue
                 if skip_next_py:
                     skip_next_py = False
                     continue
                 if tok == "--":
                     break
-                if tok in ("-W", "-X", "--check-hash-based-pycs"):
+                if tok == "-X":
+                    expect_py_x = True
+                    continue
+                if tok in ("-W", "--check-hash-based-pycs"):
                     skip_next_py = True
                     continue
-                if tok.startswith(("-W", "-X")) and not tok.startswith("--"):
+                if tok.startswith("-X") and not tok.startswith("--"):
+                    _validate_python_x_opt(tok[2:])
+                    continue
+                if tok.startswith("-W") and not tok.startswith("--"):
                     continue
                 if not tok.startswith("-"):
                     break
                 if not tok.startswith("--"):
-                    if "c" in tok[1:]:
-                        raise ScopeViolationError(
-                            self.role,
-                            "shell",
-                            command,
-                            "Inline 'python -c' code execution is disallowed",
-                        )
-                    if "m" in tok[1:]:
-                        m_idx = tok.index("m", 1)
-                        mod_rest = tok[m_idx + 1 :]
-                        if mod_rest:
-                            python_module = mod_rest
-                            python_module_end_idx = idx
-                            if python_module not in _ALLOWED_PYTHON_MODULES:
-                                raise ScopeViolationError(
-                                    self.role,
-                                    "shell",
-                                    command,
-                                    f"Python module {python_module!r} is not in allowed_python_modules {sorted(_ALLOWED_PYTHON_MODULES)}",
-                                )
+                    short_chars = tok[1:]
+                    for c_pos, ch in enumerate(short_chars):
+                        if ch == "c":
+                            raise ScopeViolationError(
+                                self.role,
+                                "shell",
+                                command,
+                                "Inline 'python -c' code execution is disallowed",
+                            )
+                        if ch == "X":
+                            x_rest = short_chars[c_pos + 1 :]
+                            if x_rest:
+                                _validate_python_x_opt(x_rest)
+                            else:
+                                expect_py_x = True
                             break
-                        expect_py_module = True
-                        continue
+                        if ch == "W":
+                            w_rest = short_chars[c_pos + 1 :]
+                            if not w_rest:
+                                skip_next_py = True
+                            break
+                        if ch == "m":
+                            mod_rest = short_chars[c_pos + 1 :]
+                            if mod_rest:
+                                python_module = mod_rest
+                                python_module_end_idx = idx
+                                if python_module not in _ALLOWED_PYTHON_MODULES:
+                                    raise ScopeViolationError(
+                                        self.role,
+                                        "shell",
+                                        command,
+                                        f"Python module {python_module!r} is not in allowed_python_modules {sorted(_ALLOWED_PYTHON_MODULES)}",
+                                    )
+                            else:
+                                expect_py_module = True
+                            break
+                    if python_module is not None:
+                        break
+            if expect_py_x:
+                raise ScopeViolationError(
+                    self.role,
+                    "shell",
+                    command,
+                    "Missing value for Python '-X' flag",
+                )
             if expect_py_module:
                 raise ScopeViolationError(
                     self.role,
@@ -1498,6 +1757,8 @@ class RolePolicy:
                     expect_pytest_p = False
                     if tok == "no:cacheprovider":
                         has_no_cacheprovider = True
+                    elif tok == "cacheprovider":
+                        has_no_cacheprovider = False
             elif in_pytest_section:
                 if pytest_after_double_dash:
                     pytest_positional_args.append(tok)
@@ -1515,6 +1776,8 @@ class RolePolicy:
                 elif tok.startswith("-p") and not tok.startswith("--") and len(tok) > 2:
                     if tok[2:] == "no:cacheprovider":
                         has_no_cacheprovider = True
+                    elif tok[2:] == "cacheprovider":
+                        has_no_cacheprovider = False
                 elif not tok.startswith("--") and len(tok) > 2 and _parse_bundled_pytest_p(tok)[0]:
                     _, bundled_p = _parse_bundled_pytest_p(tok)
                     if bundled_p is None:
@@ -2558,6 +2821,13 @@ class RolePolicy:
                 if isinstance(parsed, dict):
                     args = parsed
                 elif isinstance(parsed, str):
+                    if parsed.strip().startswith(("{", "[")):
+                        raise ScopeViolationError(
+                            self.role,
+                            "tool",
+                            tool_name,
+                            "Double-encoded JSON toolArgs payload is disallowed (fail closed)",
+                        )
                     args = {"raw": parsed}
                 else:
                     raise ScopeViolationError(
@@ -2576,7 +2846,8 @@ class RolePolicy:
                 f"Malformed toolArgs type {type(tool_args).__name__} (fail closed)",
             )
 
-        if any(k in norm_name for k in ("merge", "push")):
+        name_tokens = _split_tool_name_tokens(tool_name)
+        if any(tok in ("merge", "push") for tok in name_tokens):
             raise ScopeViolationError(
                 self.role, "tool", tool_name, "Workers are forbidden from merging or pushing"
             )
@@ -2601,7 +2872,27 @@ class RolePolicy:
 
         non_shell_cwd, _, resolved_cwds = self._extract_and_validate_cwds(args, tool_name)
 
-        if norm_name in _WRITE_TOOLS or (
+        # Enforce any shell command keys (and raw strings on shell-like tools) BEFORE write/read routing
+        shell_cmd_values = self._extract_shell_command_values(args, tool_name)
+        for cmd_val in shell_cmd_values:
+            self.enforce_shell(cmd_val, cwd=non_shell_cwd)
+
+        is_shell_like = any(tok in _SHELL_NAME_TOKENS for tok in name_tokens) or any(
+            k in norm_name for k in ("terminal", "command")
+        )
+        if is_shell_like and not shell_cmd_values:
+            raw_val = args.get("raw")
+            if isinstance(raw_val, str):
+                if not raw_val.strip():
+                    raise ScopeViolationError(
+                        self.role,
+                        "tool",
+                        tool_name,
+                        "Shell-like tool call has empty raw command argument (fail closed)",
+                    )
+                self.enforce_shell(raw_val, cwd=non_shell_cwd)
+
+        is_write_routed = norm_name in _WRITE_TOOLS or (
             norm_name not in _READ_TOOLS
             and any(
                 k in norm_name
@@ -2621,7 +2912,8 @@ class RolePolicy:
                     "truncate",
                 )
             )
-        ):
+        )
+        if is_write_routed:
             extracted = self._extract_tool_paths(args)
             if not extracted:
                 raise ScopeViolationError(
@@ -2655,10 +2947,20 @@ class RolePolicy:
                 f"Read-only role cannot invoke unrecognized or mutating tool {tool_name!r}",
             )
 
-        # Unrecognized tools carrying shell command keys or path args must be strictly validated.
-        for cmd_val in self._extract_shell_command_values(args, tool_name):
-            self.enforce_shell(cmd_val, cwd=non_shell_cwd)
+        if (
+            is_shell_like
+            and not shell_cmd_values
+            and not isinstance(args.get("raw"), str)
+            and not self._extract_tool_paths(args, extra_keys=_READ_EXTRA_PATH_KEYS)
+        ):
+            raise ScopeViolationError(
+                self.role,
+                "tool",
+                tool_name,
+                "Shell-like tool call missing command argument (fail closed)",
+            )
 
+        # Unrecognized tools carrying path args must be strictly validated.
         for target in self._extract_tool_paths(args):
             for base_dir in resolved_cwds:
                 self.enforce_write(target, base_dir=base_dir)
@@ -2759,6 +3061,13 @@ class RolePolicy:
                 if isinstance(parsed, dict):
                     return dict(parsed)
                 if isinstance(parsed, str):
+                    if parsed.strip().startswith(("{", "[")):
+                        raise ScopeViolationError(
+                            self.role,
+                            "tool",
+                            tool_name,
+                            f"Double-encoded JSON {key_name} payload is disallowed (fail closed)",
+                        )
                     return {"raw": parsed}
                 raise ScopeViolationError(
                     self.role,
