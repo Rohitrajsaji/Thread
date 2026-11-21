@@ -171,7 +171,18 @@ _PATH_ARG_KEYS = (
 )
 
 _PATH_LIST_KEYS = frozenset(
-    {"paths", "files", "file_paths", "filePaths", "targets", "roots", "directories", "dirs"}
+    {
+        "paths",
+        "files",
+        "file_paths",
+        "filePaths",
+        "targets",
+        "roots",
+        "directories",
+        "dirs",
+        "urls",
+        "uris",
+    }
 )
 
 _PYTEST_VALUE_SHORT_FLAGS = frozenset({"k", "m", "c", "r", "W", "n", "p"})
@@ -183,7 +194,13 @@ _READ_EXTRA_PATH_KEYS = frozenset(
         "workingDirectory",
         "search_path",
         "SearchPath",
+        "search_paths",
+        "searchPaths",
         "root",
+        "root_dir",
+        "rootDir",
+        "folder",
+        "folders",
     }
 )
 
@@ -349,6 +366,18 @@ def _parse_bundled_pytest_o(tok: str) -> tuple[bool, str | None, bool]:
                 return True, val, (val == "")
             return True, rest, False
     return False, None, False
+
+
+def _has_pytest_c_flag(tok: str) -> bool:
+    """Return True if ``tok`` is a pytest short option cluster invoking ``-c`` (config file)."""
+    if not tok.startswith("-") or tok.startswith("--") or len(tok) < 2:
+        return False
+    for ch in tok[1:]:
+        if ch == "c":
+            return True
+        if ch in _PYTEST_VALUE_SHORT_FLAGS or ch == "o":
+            return False
+    return False
 
 
 def _has_unquoted_shell_metachar(command: str) -> str | None:
@@ -639,6 +668,16 @@ class RolePolicy:
         if not tokens:
             raise ScopeViolationError(self.role, "shell", command, "Empty command tokens")
 
+        return self._validate_shell_tokens(tokens, command, check_prefix=True, in_pytest_addopts=False)
+
+    def _validate_shell_tokens(
+        self,
+        tokens: list[str],
+        command: str,
+        *,
+        check_prefix: bool = True,
+        in_pytest_addopts: bool = False,
+    ) -> list[str]:
         exe = Path(tokens[0]).name
         exe_lower = exe.lower()
 
@@ -1030,30 +1069,31 @@ class RolePolicy:
                         f"Read-only role cannot use file-writing flag {t_flag!r}",
                     )
 
-        if not self.allowed_shell_prefixes:
-            raise ScopeViolationError(
-                self.role, "shell", command, "No allowed_shell_prefixes configured"
-            )
+        if check_prefix:
+            if not self.allowed_shell_prefixes:
+                raise ScopeViolationError(
+                    self.role, "shell", command, "No allowed_shell_prefixes configured"
+                )
 
-        matched_prefix = False
-        for prefix in self.allowed_shell_prefixes:
-            try:
-                prefix_tokens = shlex.split(prefix)
-            except ValueError:
-                continue
-            if not prefix_tokens:
-                continue
-            if len(tokens) >= len(prefix_tokens) and tokens[: len(prefix_tokens)] == prefix_tokens:
-                matched_prefix = True
-                break
+            matched_prefix = False
+            for prefix in self.allowed_shell_prefixes:
+                try:
+                    prefix_tokens = shlex.split(prefix)
+                except ValueError:
+                    continue
+                if not prefix_tokens:
+                    continue
+                if len(tokens) >= len(prefix_tokens) and tokens[: len(prefix_tokens)] == prefix_tokens:
+                    matched_prefix = True
+                    break
 
-        if not matched_prefix:
-            raise ScopeViolationError(
-                self.role,
-                "shell",
-                command,
-                f"Command {command!r} does not match allowed_shell_prefixes {self.allowed_shell_prefixes}",
-            )
+            if not matched_prefix:
+                raise ScopeViolationError(
+                    self.role,
+                    "shell",
+                    command,
+                    f"Command {command!r} does not match allowed_shell_prefixes {self.allowed_shell_prefixes}",
+                )
 
         # Ensure file-writing flags (both `--flag=path` and `--flag path`) and path-like tokens stay in scope
         expect_write_flag: str | None = None
@@ -1083,7 +1123,9 @@ class RolePolicy:
 
             if expect_pytest_ini:
                 expect_pytest_ini = False
-                self._check_pytest_override_ini(tok, command)
+                self._check_pytest_override_ini(
+                    tok, command, in_pytest_addopts=in_pytest_addopts
+                )
                 continue
 
             if (
@@ -1140,7 +1182,9 @@ class RolePolicy:
                         if attached_o is None:
                             expect_pytest_ini = True
                         else:
-                            self._check_pytest_override_ini(attached_o, command)
+                            self._check_pytest_override_ini(
+                                attached_o, command, in_pytest_addopts=in_pytest_addopts
+                            )
                         continue
 
                 # Glued short flags (`-o<val>`, `-d<val>`) must be checked BEFORE `if "=" in tok:`
@@ -1160,7 +1204,9 @@ class RolePolicy:
                                 command,
                                 "Read-only role cannot override pytest ini via '-o'",
                             )
-                        self._check_pytest_override_ini(attached, command)
+                        self._check_pytest_override_ini(
+                            attached, command, in_pytest_addopts=in_pytest_addopts
+                        )
                     else:
                         if self.readonly:
                             raise ScopeViolationError(
@@ -1220,7 +1266,9 @@ class RolePolicy:
                                 command,
                                 f"Read-only role cannot override pytest ini via {flag_name!r}",
                             )
-                        self._check_pytest_override_ini(flag_val, command)
+                        self._check_pytest_override_ini(
+                            flag_val, command, in_pytest_addopts=in_pytest_addopts
+                        )
                         continue
                     candidates = [flag_val]
                     if ":" in flag_val and not (len(flag_val) >= 2 and flag_val[1] == ":"):
@@ -1315,10 +1363,74 @@ class RolePolicy:
 
         return tokens
 
-    def _check_pytest_override_ini(self, val: str, command: str) -> None:
+    def _check_pytest_override_ini(
+        self, val: str, command: str, *, in_pytest_addopts: bool = False
+    ) -> None:
         if "=" in val:
             ini_key, ini_val = val.split("=", 1)
             key_lower = ini_key.strip().lower()
+            if key_lower == "addopts":
+                if self.readonly:
+                    raise ScopeViolationError(
+                        self.role,
+                        "shell",
+                        command,
+                        f"Read-only role cannot override pytest ini {ini_key!r}",
+                    )
+                if in_pytest_addopts:
+                    raise ScopeViolationError(
+                        self.role,
+                        "shell",
+                        command,
+                        "Nested pytest 'addopts' override is disallowed",
+                    )
+                if "\x00" in ini_val:
+                    raise ScopeViolationError(
+                        self.role,
+                        "shell",
+                        command,
+                        "Null byte in pytest addopts override",
+                    )
+                bad_meta = _has_unquoted_shell_metachar(ini_val)
+                if bad_meta is not None:
+                    raise ScopeViolationError(
+                        self.role,
+                        "shell",
+                        command,
+                        f"Disallowed shell metacharacter {bad_meta!r} in pytest addopts override",
+                    )
+                try:
+                    addopts_tokens = shlex.split(ini_val)
+                except ValueError as exc:
+                    raise ScopeViolationError(
+                        self.role,
+                        "shell",
+                        command,
+                        f"Malformed pytest addopts override syntax: {exc}",
+                    ) from exc
+                if not addopts_tokens:
+                    return
+                for atok in addopts_tokens:
+                    if (
+                        atok in ("-c", "--config-file", "--rootdir", "--confcutdir", "--debug")
+                        or atok.startswith(
+                            ("--config-file=", "--rootdir=", "--confcutdir=", "--debug=")
+                        )
+                        or _has_pytest_c_flag(atok)
+                    ):
+                        raise ScopeViolationError(
+                            self.role,
+                            "shell",
+                            command,
+                            f"Disallowed pytest config/rootdir flag {atok!r} in addopts override",
+                        )
+                self._validate_shell_tokens(
+                    ["pytest", *addopts_tokens],
+                    command,
+                    check_prefix=False,
+                    in_pytest_addopts=True,
+                )
+                return
             if key_lower in ("log_file", "cache_dir", "basetemp", "resultlog"):
                 if self.readonly:
                     raise ScopeViolationError(

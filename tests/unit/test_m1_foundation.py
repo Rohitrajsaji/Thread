@@ -1892,3 +1892,405 @@ def test_sdk_fail_closed_permission_kinds_mcp_url_read_keys_and_null_uri(tmp_pat
 
     # In-scope grep_search search_path remains allowed for non-readonly role
     be.enforce_tool_call("grep_search", {"options": {"search_path": "app"}})
+
+
+# ---------------------------------------------------------------------------
+# 12. Iteration 6 Regression Tests (R5 Reviewer & Challenger Findings)
+# ---------------------------------------------------------------------------
+
+
+def test_pytest_addopts_override_and_nested_smuggling(tmp_path: Path) -> None:
+    """Verify pytest -o/--override-ini addopts smuggling is blocked while safe addopts pass."""
+    wt = tmp_path / "wt"
+    (wt / "tests" / "unit").mkdir(parents=True)
+    (wt / "tests" / "unit" / "test_ok.py").write_text("def test_ok(): pass\n", encoding="utf-8")
+
+    be = RolePolicy(
+        role="backend",
+        worktree_root=wt,
+        allowed_paths=["app/**", "tests/**"],
+        denied_paths=[".thread/policy.yaml"],
+        deny_gate_files=["tests/acceptance/**"],
+        allowed_shell_prefixes=["pytest", "python"],
+    )
+    py_only_be = RolePolicy(
+        role="backend",
+        worktree_root=wt,
+        allowed_paths=["app/**", "tests/**"],
+        denied_paths=[".thread/policy.yaml"],
+        allowed_shell_prefixes=["python -m pytest"],
+    )
+    ro = RolePolicy(
+        role="reviewer_readonly",
+        worktree_root=wt,
+        allowed_paths=[],
+        denied_paths=["**"],
+        allowed_shell_prefixes=["pytest", "python"],
+        readonly=True,
+    )
+
+    for bad_cmd in (
+        'pytest -o addopts="--log-file=.thread/policy.yaml" tests/unit/test_ok.py',
+        'pytest -o addopts="--log-file .thread/policy.yaml" tests/unit/test_ok.py',
+        'pytest -o addopts="--junitxml=.thread/policy.yaml" tests/unit/test_ok.py',
+        'pytest -o addopts="--junit-xml=.thread/policy.yaml" tests/unit/test_ok.py',
+        'pytest -o addopts="--basetemp=.thread/evil" tests/unit/test_ok.py',
+        'pytest -o addopts="--cache-dir=.thread/evil" tests/unit/test_ok.py',
+        'pytest -o addopts="--resultlog=.thread/policy.yaml" tests/unit/test_ok.py',
+        'pytest -o addopts="--rootdir=.thread/evil" tests/unit/test_ok.py',
+        'pytest -o addopts="-c .thread/evil.ini" tests/unit/test_ok.py',
+        'pytest -o addopts="-vc pyproject.toml" tests/unit/test_ok.py',
+        'pytest -o addopts="--debug=.thread/policy.yaml" tests/unit/test_ok.py',
+        'pytest -o addopts="-o log_file=.thread/policy.yaml" tests/unit/test_ok.py',
+        'pytest -o addopts="-qo log_file=.thread/policy.yaml" tests/unit/test_ok.py',
+        'pytest -o addopts="-o addopts=--log-file=.thread/policy.yaml" tests/unit/test_ok.py',
+        'pytest -o addopts="-qo addopts=--junitxml=.thread/policy.yaml" tests/unit/test_ok.py',
+        'pytest -o addopts="--override-ini addopts=--basetemp=.thread/evil" tests/unit/test_ok.py',
+        'pytest -qo addopts="--log-file=.thread/policy.yaml" tests/unit/test_ok.py',
+        'pytest --override-ini addopts="--basetemp=.thread/evil" tests/unit/test_ok.py',
+        'pytest --override-ini=addopts="--junitxml=.thread/policy.yaml" tests/unit/test_ok.py',
+        'pytest -oaddopts="--log-file=.thread/policy.yaml" tests/unit/test_ok.py',
+        'python -m pytest -o addopts="--log-file=.thread/policy.yaml" tests/unit/test_ok.py',
+        'python -m coverage run -m pytest -o addopts="--log-file=.thread/policy.yaml" tests/unit/test_ok.py',
+        "pytest -o 'addopts=-v; rm -rf /' tests/unit/test_ok.py",
+        "pytest -o addopts='\"unclosed' tests/unit/test_ok.py",
+        'pytest -o addopts="../outside" tests/unit/test_ok.py',
+    ):
+        with pytest.raises(ScopeViolationError):
+            be.enforce_shell(bad_cmd)
+
+    with pytest.raises(ScopeViolationError):
+        ro.enforce_shell('pytest -o addopts="-v -k test_foo" tests/unit/test_ok.py')
+
+    # Legitimate safe addopts pass cleanly (including prefix-restricted python -m pytest)
+    assert be.enforce_shell('pytest -o addopts="-v -k test_foo" tests/unit/test_ok.py')
+    assert be.enforce_shell('pytest -o addopts="" tests/unit/test_ok.py')
+    assert be.enforce_shell('pytest -o addopts="-p no:cacheprovider -W ignore" tests/unit/test_ok.py')
+    assert py_only_be.enforce_shell(
+        'python -m pytest -o addopts="-v -k test_foo" tests/unit/test_ok.py'
+    )
+
+
+def test_sdk_hoisted_sandbox_checks_write_new_contents_read_resolved_and_shell_paths(
+    tmp_path: Path,
+) -> None:
+    """Verify hoisted sandbox flags/grants, write new_file_contents/file_edits, read resolved_path, and shell paths."""
+    from copilot.generated.session_events import (
+        PermissionPromptRequestCommands,
+        PermissionPromptRequestPath,
+        PermissionPromptRequestPathAccessKind,
+        PermissionRequestMcp,
+        PermissionRequestRead,
+        PermissionRequestShell,
+        PermissionRequestWrite,
+        PermissionSandboxPathGrant,
+        PermissionSandboxPathGrantAccess,
+        PermissionWriteFileContent,
+        PermissionWriteFileEdit,
+    )
+
+    wt = tmp_path / "wt"
+    (wt / "app").mkdir(parents=True)
+    (wt / "app" / "main.py").write_text("x = 1\n", encoding="utf-8")
+    (wt / "tests" / "unit").mkdir(parents=True)
+
+    be = RolePolicy(
+        role="backend",
+        worktree_root=wt,
+        allowed_paths=["app/**", "tests/**"],
+        denied_paths=[".thread/policy.yaml"],
+        allowed_shell_prefixes=["pytest", "git status"],
+    )
+    ro = RolePolicy(
+        role="reviewer_readonly",
+        worktree_root=wt,
+        allowed_paths=[],
+        denied_paths=["**"],
+        allowed_shell_prefixes=["pytest", "git status"],
+        readonly=True,
+    )
+    sdk_be = CopilotSdkAdapter(be)
+    sdk_ro = CopilotSdkAdapter(ro)
+
+    deny_reqs: list[Any] = [
+        PermissionRequestWrite(
+            can_offer_session_approval=False,
+            diff="+x",
+            file_name="app/main.py",
+            intention="write",
+            request_sandbox_bypass=True,
+        ),
+        {
+            "kind": "write",
+            "file_name": "app/main.py",
+            "request_sandbox_permissive": True,
+        },
+        PermissionRequestWrite(
+            can_offer_session_approval=False,
+            diff="+x",
+            file_name="app/main.py",
+            intention="write",
+            sandbox_path_grant=PermissionSandboxPathGrant(
+                access=PermissionSandboxPathGrantAccess.READ_WRITE,
+                path=".thread/policy.yaml",
+            ),
+        ),
+        PermissionRequestWrite(
+            can_offer_session_approval=False,
+            diff="+x",
+            file_name="app/main.py",
+            intention="write",
+            sandbox_path_grant=PermissionSandboxPathGrant(
+                access=PermissionSandboxPathGrantAccess.READ_WRITE,
+                path="",
+            ),
+        ),
+        PermissionRequestWrite(
+            can_offer_session_approval=False,
+            diff="+x",
+            file_name="app/main.py",
+            intention="write",
+            new_file_contents=[PermissionWriteFileContent(content="evil", path=".thread/policy.yaml")],  # type: ignore[arg-type]
+        ),
+        PermissionRequestWrite(
+            can_offer_session_approval=False,
+            diff="+x",
+            file_name="app/main.py",
+            intention="write",
+            new_file_contents=[{"content": "evil"}],  # type: ignore[arg-type]
+        ),
+        PermissionRequestWrite(
+            can_offer_session_approval=False,
+            diff="+x",
+            file_name="app/main.py",
+            intention="write",
+            file_edits=[
+                PermissionWriteFileEdit(
+                    after=PermissionWriteFileContent(content="evil", path=".thread/policy.yaml")
+                )
+            ],
+        ),
+        PermissionRequestRead(
+            intention="read",
+            path="app/main.py",
+            resolved_path="/etc/passwd",
+        ),
+        PermissionRequestRead(
+            intention="read",
+            path="app/main.py",
+            request_sandbox_bypass=True,
+        ),
+        PermissionRequestRead(
+            intention="read",
+            path="app/main.py",
+            sandbox_path_grant=PermissionSandboxPathGrant(
+                access=PermissionSandboxPathGrantAccess.READ,
+                path="/etc/shadow",
+            ),
+        ),
+        PermissionRequestRead(
+            intention="read",
+            path="app/main.py",
+            sandbox_path_grant=PermissionSandboxPathGrant(
+                access=PermissionSandboxPathGrantAccess.READ_WRITE,
+                path=".thread/policy.yaml",
+            ),
+        ),
+        PermissionRequestShell(
+            can_offer_session_approval=False,
+            commands=[],
+            full_command_text="pytest tests/unit",
+            has_write_file_redirection=False,
+            intention="run tests",
+            possible_paths=[],
+            possible_urls=[],
+            request_sandbox_permissive=True,
+        ),
+        PermissionRequestShell(
+            can_offer_session_approval=False,
+            commands=[],
+            full_command_text="pytest tests/unit",
+            has_write_file_redirection=False,
+            intention="run tests",
+            possible_paths=["/etc/passwd"],
+            possible_urls=[],
+        ),
+        PermissionRequestShell(
+            can_offer_session_approval=False,
+            commands=[],
+            full_command_text="pytest tests/unit",
+            has_write_file_redirection=False,
+            intention="run tests",
+            possible_paths=["tests/unit"],
+            possible_urls=[],
+            resolved_paths={"tests/unit": "/etc/passwd"},
+        ),
+        PermissionRequestShell(
+            can_offer_session_approval=False,
+            commands=[],
+            full_command_text="pytest tests/unit",
+            has_write_file_redirection=True,
+            intention="redirect output",
+            possible_paths=[".thread/policy.yaml"],
+            possible_urls=[],
+        ),
+        PermissionRequestShell(
+            can_offer_session_approval=False,
+            commands=[],
+            full_command_text="pytest tests/unit",
+            has_write_file_redirection=True,
+            intention="redirect without paths",
+            possible_paths=[],
+            possible_urls=[],
+            resolved_paths=None,
+        ),
+        PermissionPromptRequestCommands(
+            can_offer_session_approval=False,
+            command_identifiers=["pytest"],
+            full_command_text="pytest tests/unit",
+            intention="run tests",
+            request_sandbox_bypass=True,
+        ),
+        {
+            "kind": "path",
+            "access_kind": "read",
+            "paths": ["app/main.py"],
+            "request_sandbox_bypass": True,
+        },
+        PermissionRequestShell(
+            can_offer_session_approval=False,
+            commands=[],
+            full_command_text="pytest tests/unit",
+            has_write_file_redirection=False,
+            intention="run tests",
+            possible_paths=[],
+            possible_urls=[],
+            resolved_paths={"/etc/passwd": ""},
+        ),
+        PermissionRequestMcp(
+            read_only=True,
+            server_name="web",
+            tool_name="fetch",
+            tool_title="Fetch",
+            args={"urls": ["https://evil.example.com/secret"]},
+        ),
+        PermissionRequestMcp(
+            read_only=True,
+            server_name="web",
+            tool_name="fetch",
+            tool_title="Fetch",
+            args={"uris": ["https://evil.example.com/secret"]},
+        ),
+    ]
+    for req in deny_reqs:
+        dec = asyncio.run(sdk_be._on_permission_request(req))
+        dec_kind = dec["kind"] if isinstance(dec, dict) else getattr(dec, "kind", None)
+        assert dec_kind == "denied-by-rules", f"Expected denied-by-rules for {req!r}, got {dec!r}"
+
+    # Read-only policy must reject shell write redirection even for otherwise allowed paths
+    ro_redir = PermissionRequestShell(
+        can_offer_session_approval=False,
+        commands=[],
+        full_command_text="pytest tests/unit",
+        has_write_file_redirection=True,
+        intention="redirect output",
+        possible_paths=["app/out.txt"],
+        possible_urls=[],
+    )
+    ro_dec = asyncio.run(sdk_ro._on_permission_request(ro_redir))
+    assert getattr(ro_dec, "kind", None) == "denied-by-rules"
+
+    # Non-regression: legitimate PermissionRequestWrite / Read / Shell pass cleanly
+    ok_reqs: list[Any] = [
+        PermissionRequestWrite(
+            can_offer_session_approval=False,
+            diff="+x = 2",
+            file_name="app/main.py",
+            intention="write",
+            new_file_contents="x = 2\n",
+        ),
+        PermissionRequestWrite(
+            can_offer_session_approval=False,
+            diff="+y = 2",
+            file_name="app/main.py",
+            intention="write",
+            new_file_contents=[PermissionWriteFileContent(content="y = 2\n", path="app/other.py")],  # type: ignore[arg-type]
+        ),
+        PermissionRequestRead(
+            intention="read",
+            path="app/main.py",
+            resolved_path=str(wt / "app" / "main.py"),
+            sandbox_path_grant=PermissionSandboxPathGrant(
+                access=PermissionSandboxPathGrantAccess.READ,
+                path="app/main.py",
+            ),
+        ),
+        PermissionRequestShell(
+            can_offer_session_approval=False,
+            commands=[],
+            full_command_text="pytest tests/unit",
+            has_write_file_redirection=False,
+            intention="run tests",
+            possible_paths=[],
+            possible_urls=[],
+            resolved_paths=None,
+        ),
+        PermissionRequestShell(
+            can_offer_session_approval=False,
+            commands=[],
+            full_command_text="pytest tests/unit",
+            has_write_file_redirection=False,
+            intention="run tests",
+            possible_paths=["tests/unit"],
+            possible_urls=[],
+            resolved_paths={"tests/unit": str(wt / "tests" / "unit")},
+        ),
+        PermissionRequestShell(
+            can_offer_session_approval=False,
+            commands=[],
+            full_command_text="pytest tests/unit",
+            has_write_file_redirection=True,
+            intention="redirect output in scope",
+            possible_paths=["app/out.txt"],
+            possible_urls=[],
+        ),
+        PermissionPromptRequestPath(
+            access_kind=PermissionPromptRequestPathAccessKind.READ,
+            paths=["app/main.py"],
+        ),
+    ]
+    for ok_req in ok_reqs:
+        ok_dec = asyncio.run(sdk_be._on_permission_request(ok_req))
+        assert getattr(ok_dec, "kind", None) == "approve-once", (
+            f"Expected approve-once for {ok_req!r}, got {ok_dec!r}"
+        )
+
+
+def test_read_search_extra_path_keys_containment(tmp_path: Path) -> None:
+    """Verify grep_search search_paths/searchPaths/folder/folders/root_dir/rootDir enforce containment."""
+    wt = tmp_path / "wt"
+    (wt / "app").mkdir(parents=True)
+    (wt / "app" / "main.py").write_text("x = 1\n", encoding="utf-8")
+
+    be = RolePolicy(
+        role="backend",
+        worktree_root=wt,
+        allowed_paths=["app/**", "tests/**"],
+        denied_paths=[".thread/policy.yaml"],
+    )
+
+    for bad_args in (
+        {"options": {"search_paths": ["/etc"]}},
+        {"options": {"searchPaths": ["/etc"]}},
+        {"folder": "/etc"},
+        {"folders": ["/etc"]},
+        {"root_dir": "/etc"},
+        {"rootDir": "/etc"},
+    ):
+        with pytest.raises(ScopeViolationError):
+            be.enforce_tool_call("grep_search", bad_args)
+
+    # In-scope read/search paths remain allowed for non-readonly role
+    be.enforce_tool_call("grep_search", {"options": {"search_paths": ["app"]}})
+    be.enforce_tool_call("grep_search", {"folder": "app"})
+    be.enforce_tool_call("grep_search", {"root_dir": "app"})

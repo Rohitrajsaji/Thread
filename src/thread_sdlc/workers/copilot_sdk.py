@@ -10,7 +10,7 @@ import shutil
 import time
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from thread_sdlc.governance import redactor
 from thread_sdlc.workers.adapter import (
@@ -102,6 +102,47 @@ def _extract_attr_or_key(obj: Any, *names: str) -> Any:
         if hasattr(obj, name):
             return getattr(obj, name)
     return None
+
+
+def _extract_shell_paths(raw_paths: Any) -> list[str]:
+    """Extract non-empty path strings from SDK ``possible_paths`` / ``resolved_paths``."""
+    extracted: list[str] = []
+    if raw_paths is None:
+        return extracted
+    if isinstance(raw_paths, str):
+        if raw_paths.strip():
+            extracted.append(raw_paths.strip())
+        return extracted
+    if isinstance(raw_paths, dict):
+        direct = _extract_attr_or_key(
+            raw_paths, "path", "file_name", "fileName", "resolved_path", "resolvedPath"
+        )
+        if direct is not None:
+            items: list[Any] = [direct]
+        else:
+            items = []
+            for k, v in raw_paths.items():
+                if v is None or (isinstance(v, str) and not v.strip()):
+                    if isinstance(k, str) and k.strip():
+                        items.append(k)
+                else:
+                    items.append(v)
+    elif isinstance(raw_paths, (list, tuple, set)):
+        items = list(raw_paths)
+    else:
+        items = [raw_paths]
+
+    for item in items:
+        if isinstance(item, str):
+            if item.strip():
+                extracted.append(item.strip())
+        elif item is not None:
+            p = _extract_attr_or_key(
+                item, "path", "file_name", "fileName", "resolved_path", "resolvedPath"
+            )
+            if isinstance(p, str) and p.strip():
+                extracted.append(p.strip())
+    return extracted
 
 
 class CopilotSdkAdapter(BaseWorkerAdapter):
@@ -212,7 +253,56 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
     ) -> Any:
         raw_kind = _extract_attr_or_key(request, "kind")
         kind = str(getattr(raw_kind, "value", raw_kind) or "").strip().lower()
+        op: Literal["write", "read", "shell", "tool"]
+        if kind == "write":
+            op = "write"
+        elif kind == "read":
+            op = "read"
+        elif kind in ("shell", "commands"):
+            op = "shell"
+        else:
+            op = "tool"
         try:
+            # Hoist sandbox bypass / permissive / path-grant checks across ALL permission kinds
+            if _extract_attr_or_key(request, "request_sandbox_bypass", "requestSandboxBypass"):
+                raise ScopeViolationError(
+                    self._policy.role,
+                    op,
+                    "<sandbox-bypass>",
+                    "Sandbox bypass requests are denied by Thread role policy (fail closed)",
+                )
+            if _extract_attr_or_key(
+                request, "request_sandbox_permissive", "requestSandboxPermissive"
+            ):
+                raise ScopeViolationError(
+                    self._policy.role,
+                    op,
+                    "<sandbox-permissive>",
+                    "Permissive sandbox requests are denied by Thread role policy (fail closed)",
+                )
+            sandbox_grant = _extract_attr_or_key(
+                request, "sandbox_path_grant", "sandboxPathGrant"
+            )
+            if sandbox_grant is not None:
+                grant_path = _extract_attr_or_key(sandbox_grant, "path")
+                if not isinstance(grant_path, str) or not grant_path.strip():
+                    raise ScopeViolationError(
+                        self._policy.role,
+                        op,
+                        "<sandbox-path-grant>",
+                        "Sandbox path grant missing target path (fail closed)",
+                    )
+                grant_access_raw = _extract_attr_or_key(sandbox_grant, "access")
+                grant_access = (
+                    str(getattr(grant_access_raw, "value", grant_access_raw) or "")
+                    .strip()
+                    .lower()
+                )
+                if grant_access == "read":
+                    self._policy.enforce_read(grant_path.strip())
+                else:
+                    self._policy.enforce_write(grant_path.strip())
+
             if kind == "write":
                 targets: list[str] = []
                 for attr in ("file_name", "fileName", "resolved_path", "resolvedPath", "path"):
@@ -220,11 +310,44 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
                     if isinstance(val, str) and val.strip():
                         targets.append(val.strip())
                 edits = _extract_attr_or_key(request, "file_edits", "fileEdits")
-                if isinstance(edits, list):
+                if isinstance(edits, (list, tuple)):
                     for ed in edits:
                         fn = _extract_attr_or_key(ed, "file_name", "fileName", "path")
                         if isinstance(fn, str) and fn.strip():
                             targets.append(fn.strip())
+                        for side_name in ("after", "before"):
+                            side = _extract_attr_or_key(ed, side_name)
+                            if side is not None:
+                                side_path = _extract_attr_or_key(
+                                    side, "path", "file_name", "fileName"
+                                )
+                                if not isinstance(side_path, str) or not side_path.strip():
+                                    raise ScopeViolationError(
+                                        self._policy.role,
+                                        "write",
+                                        "<unknown>",
+                                        "Write permission request file_edits entry missing target path (fail closed)",
+                                    )
+                                targets.append(side_path.strip())
+                new_contents = _extract_attr_or_key(
+                    request, "new_file_contents", "newFileContents"
+                )
+                if new_contents is not None and not isinstance(new_contents, str):
+                    items = (
+                        list(new_contents)
+                        if isinstance(new_contents, (list, tuple))
+                        else [new_contents]
+                    )
+                    for item in items:
+                        item_path = _extract_attr_or_key(item, "path", "file_name", "fileName")
+                        if not isinstance(item_path, str) or not item_path.strip():
+                            raise ScopeViolationError(
+                                self._policy.role,
+                                "write",
+                                "<unknown>",
+                                "Write permission request new_file_contents item missing target path (fail closed)",
+                            )
+                        targets.append(item_path.strip())
                 if not targets:
                     raise ScopeViolationError(
                         self._policy.role,
@@ -235,29 +358,40 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
                 for target in targets:
                     self._policy.enforce_write(target)
             elif kind in ("shell", "commands"):
-                if _extract_attr_or_key(request, "request_sandbox_bypass", "requestSandboxBypass"):
-                    raise ScopeViolationError(
-                        self._policy.role,
-                        "shell",
-                        "<sandbox-bypass>",
-                        "Sandbox bypass requests are denied by Thread role policy (fail closed)",
+                has_redir = bool(
+                    _extract_attr_or_key(
+                        request, "has_write_file_redirection", "hasWriteFileRedirection"
                     )
-                sandbox_grant = _extract_attr_or_key(
-                    request, "sandbox_path_grant", "sandboxPathGrant"
                 )
-                if sandbox_grant is not None:
-                    grant_path = _extract_attr_or_key(sandbox_grant, "path")
-                    grant_access_raw = _extract_attr_or_key(sandbox_grant, "access")
-                    grant_access = (
-                        str(getattr(grant_access_raw, "value", grant_access_raw) or "")
-                        .strip()
-                        .lower()
-                    )
-                    if isinstance(grant_path, str) and grant_path.strip():
-                        if grant_access == "read":
-                            self._policy.enforce_read(grant_path.strip())
-                        else:
-                            self._policy.enforce_write(grant_path.strip())
+                possible_paths_raw = _extract_attr_or_key(
+                    request, "possible_paths", "possiblePaths"
+                )
+                resolved_paths_raw = _extract_attr_or_key(
+                    request, "resolved_paths", "resolvedPaths"
+                )
+                shell_paths = _extract_shell_paths(possible_paths_raw) + _extract_shell_paths(
+                    resolved_paths_raw
+                )
+                if has_redir:
+                    if self._policy.readonly:
+                        raise ScopeViolationError(
+                            self._policy.role,
+                            "shell",
+                            "<redirection>",
+                            "Read-only role cannot execute shell commands with write file redirection (fail closed)",
+                        )
+                    if not shell_paths:
+                        raise ScopeViolationError(
+                            self._policy.role,
+                            "shell",
+                            "<redirection>",
+                            "Shell write file redirection missing verifiable target paths (fail closed)",
+                        )
+                    for sp in shell_paths:
+                        self._policy.enforce_write(sp)
+                else:
+                    for sp in shell_paths:
+                        self._policy.enforce_read(sp)
                 cwd = _extract_attr_or_key(
                     request, "resolved_working_directory", "resolvedWorkingDirectory", "cwd"
                 )
@@ -275,15 +409,20 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
                     )
                 self._policy.enforce_shell(cmd)
             elif kind == "read":
-                target = _extract_attr_or_key(request, "path", "resolved_path", "resolvedPath")
-                if not isinstance(target, str) or not target.strip():
+                read_targets: list[str] = []
+                for attr in ("path", "resolved_path", "resolvedPath"):
+                    val = _extract_attr_or_key(request, attr)
+                    if isinstance(val, str) and val.strip():
+                        read_targets.append(val.strip())
+                if not read_targets:
                     raise ScopeViolationError(
                         self._policy.role,
                         "read",
                         "<unknown>",
                         "Read permission request missing target path (fail closed)",
                     )
-                self._policy.enforce_read(target.strip())
+                for target in read_targets:
+                    self._policy.enforce_read(target)
             elif kind == "path":
                 access_raw = _extract_attr_or_key(request, "access_kind", "accessKind")
                 access_kind = str(getattr(access_raw, "value", access_raw) or "").strip().lower()
