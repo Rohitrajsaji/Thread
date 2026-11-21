@@ -25,6 +25,7 @@ from thread_sdlc.workers.adapter import (
     is_quota_error,
 )
 from thread_sdlc.workers.permissions import (
+    _SHELL_CWD_KEYS,
     _SHELL_TOOLS,
     _WRITE_TOOLS,
     RolePolicy,
@@ -395,6 +396,28 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
                         str(target_url),
                         "Shell permission requests with external URLs are denied by Thread role policy (fail closed)",
                     )
+                cmd = _extract_attr_or_key(
+                    request, "full_command_text", "fullCommandText", "command"
+                )
+                cmd_label = cmd if isinstance(cmd, str) and cmd.strip() else "<unknown>"
+                cwd_candidates: dict[str, Any] = {}
+                for cwd_key in _SHELL_CWD_KEYS:
+                    if isinstance(request, dict):
+                        if cwd_key in request and request[cwd_key] is not None:
+                            cwd_candidates[cwd_key] = request[cwd_key]
+                    elif hasattr(request, cwd_key):
+                        val = getattr(request, cwd_key)
+                        if val is not None:
+                            cwd_candidates[cwd_key] = val
+                cwd_for_shell = self._policy._validate_shell_cwd_mapping(
+                    cwd_candidates, cmd_label
+                )
+                resolved_cwd = (
+                    self._policy.enforce_read(cwd_for_shell)
+                    if cwd_for_shell is not None
+                    else None
+                )
+
                 has_redir = bool(
                     _extract_attr_or_key(
                         request, "has_write_file_redirection", "hasWriteFileRedirection"
@@ -425,18 +448,10 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
                             "Shell write file redirection missing verifiable target paths (fail closed)",
                         )
                     for sp in shell_paths:
-                        self._policy.enforce_write(sp)
+                        self._policy.enforce_write(sp, base_dir=resolved_cwd)
                 else:
                     for sp in shell_paths:
-                        self._policy.enforce_read(sp)
-                cwd = _extract_attr_or_key(
-                    request, "resolved_working_directory", "resolvedWorkingDirectory", "cwd"
-                )
-                if isinstance(cwd, str) and cwd.strip():
-                    self._policy.enforce_read(cwd.strip())
-                cmd = _extract_attr_or_key(
-                    request, "full_command_text", "fullCommandText", "command"
-                )
+                        self._policy.enforce_read(sp, base_dir=resolved_cwd)
                 if not isinstance(cmd, str) or not cmd.strip():
                     raise ScopeViolationError(
                         self._policy.role,
@@ -444,7 +459,7 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
                         "<unknown>",
                         f"{kind!r} permission request missing command text (fail closed)",
                     )
-                self._policy.enforce_shell(cmd)
+                self._policy.enforce_shell(cmd, cwd=cwd_for_shell)
             elif kind == "read":
                 read_targets: list[str] = []
                 for attr in ("path", "resolved_path", "resolvedPath"):

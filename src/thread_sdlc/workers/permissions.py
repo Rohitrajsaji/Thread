@@ -187,7 +187,7 @@ _PATH_LIST_KEYS = frozenset(
     }
 )
 
-_PYTEST_VALUE_SHORT_FLAGS = frozenset({"k", "m", "c", "r", "W", "n", "p"})
+_PYTEST_VALUE_SHORT_FLAGS = frozenset({"k", "m", "c", "r", "W", "p"})
 
 _PYTEST_VALUE_LONG_FLAGS = frozenset(
     {
@@ -205,6 +205,7 @@ _PYTEST_VALUE_LONG_FLAGS = frozenset(
         "--color",
         "--code-highlight",
         "--pastebin",
+        "--junitprefix",
         "--junit-prefix",
         "--pythonwarnings",
         "--max-warnings",
@@ -228,7 +229,6 @@ _PYTEST_VALUE_LONG_FLAGS = frozenset(
         "--log-file-date-format",
         "--log-auto-indent",
         "--log-disable",
-        "--anyio-mode",
     }
 )
 
@@ -261,6 +261,8 @@ _READ_EXTRA_PATH_KEYS = frozenset(
         "cwd",
         "working_directory",
         "workingDirectory",
+        "resolved_working_directory",
+        "resolvedWorkingDirectory",
         "search_path",
         "SearchPath",
         "search_paths",
@@ -319,6 +321,13 @@ _ALLOWED_PYTHON_MODULES = frozenset(
 )
 
 _SHELL_CMD_KEYS = ("command", "cmd", "script", "CommandLine", "full_command_text")
+_SHELL_CWD_KEYS = (
+    "cwd",
+    "working_directory",
+    "workingDirectory",
+    "resolved_working_directory",
+    "resolvedWorkingDirectory",
+)
 
 
 class ScopeViolationError(Exception):
@@ -417,7 +426,7 @@ def _parse_bundled_pytest_o(tok: str) -> tuple[bool, str | None, bool]:
     """Inspect a short pytest option cluster like ``-qo`` or ``-qolog_file=...``.
 
     Returns ``(found_o, attached_val_or_none, has_empty_equals)``.
-    Stops scanning at value-taking short options (``k, m, c, r, W, n, p``) so
+    Stops scanning at value-taking short options (``k, m, c, r, W, p``) so
     expressions like ``-kfoo`` or ``-mnot_slow`` are never mistaken for ``-o``.
     """
     if not tok.startswith("-") or tok.startswith("--") or len(tok) <= 2:
@@ -453,7 +462,7 @@ def _parse_bundled_pytest_c(tok: str) -> tuple[bool, str | None, bool]:
     """Inspect a short pytest option cluster like ``-qc`` or ``-vc<path>``.
 
     Returns ``(found_c, attached_val_or_none, has_empty_equals)``.
-    Stops scanning at value-taking short options (``k, m, r, W, n, p`` and ``o``)
+    Stops scanning at value-taking short options (``k, m, r, W, p`` and ``o``)
     so expressions like ``-kc`` or ``-oc`` are never mistaken for ``-c``.
     """
     if not tok.startswith("-") or tok.startswith("--") or len(tok) <= 2:
@@ -627,7 +636,11 @@ class RolePolicy:
         )
 
     def _resolve_and_check_containment(
-        self, target_path: str | Path, operation: Literal["write", "read"]
+        self,
+        target_path: str | Path,
+        operation: Literal["write", "read"],
+        *,
+        base_dir: Path | None = None,
     ) -> tuple[Path, str]:
         orig_raw = str(target_path).strip()
         raw = orig_raw
@@ -663,7 +676,8 @@ class RolePolicy:
                 )
 
         p = Path(raw)
-        candidate = p if p.is_absolute() else (self.worktree_root / p)
+        anchor = base_dir if base_dir is not None else self.worktree_root
+        candidate = p if p.is_absolute() else (anchor / p)
 
         # Reject symlink components whose resolved target leaves worktree_root
         probe = candidate
@@ -697,7 +711,9 @@ class RolePolicy:
         rel_posix = rel.as_posix()
         return resolved, rel_posix
 
-    def enforce_write(self, target_path: str | Path) -> Path:
+    def enforce_write(
+        self, target_path: str | Path, *, base_dir: Path | None = None
+    ) -> Path:
         """Verify ``target_path`` may be written by this role before touching disk."""
         raw = str(target_path)
         if self.readonly:
@@ -705,7 +721,9 @@ class RolePolicy:
                 self.role, "write", raw, "Read-only role cannot write or modify files"
             )
 
-        resolved, rel_posix = self._resolve_and_check_containment(target_path, "write")
+        resolved, rel_posix = self._resolve_and_check_containment(
+            target_path, "write", base_dir=base_dir
+        )
         if rel_posix == ".":
             raise ScopeViolationError(self.role, "write", raw, "Cannot overwrite worktree root")
 
@@ -743,12 +761,145 @@ class RolePolicy:
 
         return resolved
 
-    def enforce_read(self, target_path: str | Path) -> Path:
+    def enforce_read(
+        self, target_path: str | Path, *, base_dir: Path | None = None
+    ) -> Path:
         """Verify ``target_path`` stays contained within ``worktree_root``."""
-        resolved, _ = self._resolve_and_check_containment(target_path, "read")
+        resolved, _ = self._resolve_and_check_containment(
+            target_path, "read", base_dir=base_dir
+        )
         return resolved
 
-    def enforce_shell(self, command: str) -> list[str]:
+    def _compute_lexical_paths(
+        self, raw_target: str, *, anchors: list[Path] | None = None
+    ) -> list[Path]:
+        local_raw = raw_target.strip()
+        if not local_raw:
+            return []
+        if "://" in local_raw or local_raw.lower().startswith("file:"):
+            parsed = urlsplit(local_raw)
+            if parsed.scheme.lower() != "file":
+                return []
+            if parsed.netloc and parsed.netloc.lower() != "localhost":
+                return []
+            if parsed.query or parsed.fragment:
+                return []
+            local_raw = url2pathname(parsed.path)
+            if not local_raw:
+                return []
+
+        p = Path(local_raw)
+        results: list[Path] = []
+        if not p.is_absolute():
+            base_anchors = anchors if anchors else [self.worktree_root]
+            for anchor in base_anchors:
+                lex = Path(os.path.normpath(anchor / p))
+                try:
+                    lex.relative_to(self.worktree_root)
+                except ValueError:
+                    continue
+                if lex not in results:
+                    results.append(lex)
+            return results
+
+        norm_p = Path(os.path.normpath(p))
+        cur = norm_p
+        while True:
+            if cur == self.worktree_root or cur.resolve(strict=False) == self.worktree_root:
+                rel = norm_p.relative_to(cur)
+                lex = Path(os.path.normpath(self.worktree_root / rel))
+                try:
+                    lex.relative_to(self.worktree_root)
+                except ValueError:
+                    pass
+                else:
+                    if lex not in results:
+                        results.append(lex)
+            if cur.parent == cur:
+                break
+            cur = cur.parent
+        return results
+
+    def _resolve_shell_cwd(
+        self, cwd: str | Path | None, command: str
+    ) -> tuple[Path, list[Path]]:
+        if cwd is None:
+            return self.worktree_root, [self.worktree_root]
+        if not isinstance(cwd, (str, Path)):
+            raise ScopeViolationError(
+                self.role, "shell", command, "Invalid working directory type (fail closed)"
+            )
+        raw_cwd = str(cwd).strip()
+        if not raw_cwd:
+            raise ScopeViolationError(
+                self.role, "shell", command, "Empty working directory (fail closed)"
+            )
+        resolved_cwd, _ = self._resolve_and_check_containment(raw_cwd, "read")
+        if not resolved_cwd.exists() or not resolved_cwd.is_dir():
+            raise ScopeViolationError(
+                self.role,
+                "shell",
+                command,
+                f"Working directory {raw_cwd!r} does not exist or is not a directory",
+            )
+        lexical_cwds = self._compute_lexical_paths(raw_cwd)
+        if resolved_cwd not in lexical_cwds:
+            lexical_cwds.insert(0, resolved_cwd)
+        return resolved_cwd, lexical_cwds
+
+    def _validate_shell_cwd_mapping(
+        self, mapping: dict[str, Any], command: str
+    ) -> str | None:
+        entries: list[tuple[str, str, Path]] = []
+        for key in _SHELL_CWD_KEYS:
+            if key not in mapping or mapping[key] is None:
+                continue
+            val = mapping[key]
+            if not isinstance(val, (str, Path)):
+                raise ScopeViolationError(
+                    self.role,
+                    "shell",
+                    command,
+                    f"Invalid working directory type for {key!r} (fail closed)",
+                )
+            raw_val = str(val).strip()
+            if not raw_val:
+                raise ScopeViolationError(
+                    self.role,
+                    "shell",
+                    command,
+                    f"Empty working directory value for {key!r} (fail closed)",
+                )
+            resolved, _ = self._resolve_and_check_containment(raw_val, "read")
+            if not resolved.exists() or not resolved.is_dir():
+                raise ScopeViolationError(
+                    self.role,
+                    "shell",
+                    command,
+                    f"Working directory {raw_val!r} does not exist or is not a directory",
+                )
+            entries.append((key, raw_val, resolved))
+
+        if not entries:
+            return None
+
+        first_resolved = entries[0][2]
+        for key, _, resolved in entries[1:]:
+            if resolved != first_resolved:
+                raise ScopeViolationError(
+                    self.role,
+                    "shell",
+                    command,
+                    f"Conflicting working directory values ({entries[0][0]!r} vs {key!r})",
+                )
+
+        for _, raw_val, resolved in entries:
+            lex_paths = self._compute_lexical_paths(raw_val)
+            if any(lp != resolved for lp in lex_paths):
+                return raw_val
+        return entries[0][1]
+
+    def enforce_shell(self, command: str, cwd: str | Path | None = None) -> list[str]:
         """Validate shell command against injection, git merge, readonly, and prefix allowlist."""
         if not command or not command.strip():
             raise ScopeViolationError(self.role, "shell", command, "Empty shell command")
@@ -764,6 +915,8 @@ class RolePolicy:
                 f"Disallowed shell metacharacter or chaining operator {bad_meta!r}",
             )
 
+        effective_cwd, lexical_cwds = self._resolve_shell_cwd(cwd, command)
+
         try:
             tokens = shlex.split(command)
         except ValueError as exc:
@@ -774,7 +927,14 @@ class RolePolicy:
         if not tokens:
             raise ScopeViolationError(self.role, "shell", command, "Empty command tokens")
 
-        return self._validate_shell_tokens(tokens, command, check_prefix=True, in_pytest_addopts=False)
+        return self._validate_shell_tokens(
+            tokens,
+            command,
+            check_prefix=True,
+            in_pytest_addopts=False,
+            effective_cwd=effective_cwd,
+            lexical_cwds=lexical_cwds,
+        )
 
     def _validate_shell_tokens(
         self,
@@ -783,7 +943,14 @@ class RolePolicy:
         *,
         check_prefix: bool = True,
         in_pytest_addopts: bool = False,
+        effective_cwd: Path | None = None,
+        lexical_cwds: list[Path] | None = None,
     ) -> list[str]:
+        if effective_cwd is None:
+            effective_cwd = self.worktree_root
+        if lexical_cwds is None:
+            lexical_cwds = [effective_cwd]
+
         exe = Path(tokens[0]).name
         exe_lower = exe.lower()
 
@@ -800,15 +967,15 @@ class RolePolicy:
                             command,
                             "Read-only role cannot use file-writing git flag '--output'",
                         )
-                    self.enforce_write(tok)
+                    self.enforce_write(tok, base_dir=effective_cwd)
                     continue
                 if tok == "-C" and i + 1 < len(tokens):
-                    self.enforce_read(tokens[i + 1])
+                    self.enforce_read(tokens[i + 1], base_dir=effective_cwd)
                 elif tok.startswith("-C") and len(tok) > 2:
-                    self.enforce_read(tok[2:])
+                    self.enforce_read(tok[2:], base_dir=effective_cwd)
                 elif tok.startswith("--git-dir=") or tok.startswith("--work-tree="):
                     _, val = tok.split("=", 1)
-                    self.enforce_read(val)
+                    self.enforce_read(val, base_dir=effective_cwd)
                 elif tok in ("--git-dir", "--work-tree"):
                     raise ScopeViolationError(
                         self.role, "shell", command, f"Flag {tok!r} is disallowed"
@@ -835,7 +1002,7 @@ class RolePolicy:
                             "Read-only role cannot use file-writing git flag '--output'",
                         )
                     _, out_val = tok.split("=", 1)
-                    self.enforce_write(out_val)
+                    self.enforce_write(out_val, base_dir=effective_cwd)
                 elif tok == "--ext-diff" or tok.startswith("--ext-diff="):
                     if self.readonly:
                         raise ScopeViolationError(
@@ -1247,24 +1414,34 @@ class RolePolicy:
                         command,
                         f"Read-only role cannot use file-writing flag {flag_used!r}",
                     )
-                self.enforce_write(tok)
+                self.enforce_write(tok, base_dir=effective_cwd)
                 continue
 
             if expect_pytest_ini:
                 expect_pytest_ini = False
                 self._check_pytest_override_ini(
-                    tok, command, in_pytest_addopts=in_pytest_addopts
+                    tok,
+                    command,
+                    in_pytest_addopts=in_pytest_addopts,
+                    effective_cwd=effective_cwd,
+                    lexical_cwds=lexical_cwds,
                 )
                 continue
 
             if expect_pytest_cfg:
                 expect_pytest_cfg = False
-                self._validate_pytest_config_file(tok, command)
+                self._validate_pytest_config_file(
+                    tok,
+                    command,
+                    base_dir=effective_cwd,
+                    effective_cwd=effective_cwd,
+                    lexical_cwds=lexical_cwds,
+                )
                 continue
 
             if expect_pytest_rootdir:
                 expect_pytest_rootdir = False
-                self._validate_pytest_rootdir(tok, command)
+                self._validate_pytest_rootdir(tok, command, base_dir=effective_cwd)
                 continue
 
             in_pytest_section = pytest_start_idx is not None and idx >= pytest_start_idx
@@ -1347,7 +1524,13 @@ class RolePolicy:
                         if attached_c is None:
                             expect_pytest_cfg = True
                         else:
-                            self._validate_pytest_config_file(attached_c, command)
+                            self._validate_pytest_config_file(
+                                attached_c,
+                                command,
+                                base_dir=effective_cwd,
+                                effective_cwd=effective_cwd,
+                                lexical_cwds=lexical_cwds,
+                            )
                         continue
                     found_o, attached_o, empty_eq = _parse_bundled_pytest_o(tok)
                     if found_o:
@@ -1369,7 +1552,11 @@ class RolePolicy:
                             expect_pytest_ini = True
                         else:
                             self._check_pytest_override_ini(
-                                attached_o, command, in_pytest_addopts=in_pytest_addopts
+                                attached_o,
+                                command,
+                                in_pytest_addopts=in_pytest_addopts,
+                                effective_cwd=effective_cwd,
+                                lexical_cwds=lexical_cwds,
                             )
                         continue
 
@@ -1391,7 +1578,11 @@ class RolePolicy:
                                 "Read-only role cannot override pytest ini via '-o'",
                             )
                         self._check_pytest_override_ini(
-                            attached, command, in_pytest_addopts=in_pytest_addopts
+                            attached,
+                            command,
+                            in_pytest_addopts=in_pytest_addopts,
+                            effective_cwd=effective_cwd,
+                            lexical_cwds=lexical_cwds,
                         )
                     else:
                         if self.readonly:
@@ -1401,7 +1592,7 @@ class RolePolicy:
                                 command,
                                 "Read-only role cannot use file-writing flag '-o'",
                             )
-                        self.enforce_write(attached)
+                        self.enforce_write(attached, base_dir=effective_cwd)
                     continue
 
                 if (
@@ -1418,7 +1609,7 @@ class RolePolicy:
                             command,
                             "Read-only role cannot use file-writing flag '-d'",
                         )
-                    self.enforce_write(tok[2:])
+                    self.enforce_write(tok[2:], base_dir=effective_cwd)
                     continue
 
                 if "=" in tok:
@@ -1442,7 +1633,7 @@ class RolePolicy:
                                 command,
                                 f"Missing target path for file-writing flag {flag_name!r}",
                             )
-                        self.enforce_write(flag_val)
+                        self.enforce_write(flag_val, base_dir=effective_cwd)
                         continue
                     if is_pytest and flag_name in ("--override-ini", "-o"):
                         if self.readonly:
@@ -1453,14 +1644,24 @@ class RolePolicy:
                                 f"Read-only role cannot override pytest ini via {flag_name!r}",
                             )
                         self._check_pytest_override_ini(
-                            flag_val, command, in_pytest_addopts=in_pytest_addopts
+                            flag_val,
+                            command,
+                            in_pytest_addopts=in_pytest_addopts,
+                            effective_cwd=effective_cwd,
+                            lexical_cwds=lexical_cwds,
                         )
                         continue
                     if is_pytest and not in_cov_prefix and flag_name == "--config-file":
-                        self._validate_pytest_config_file(flag_val, command)
+                        self._validate_pytest_config_file(
+                            flag_val,
+                            command,
+                            base_dir=effective_cwd,
+                            effective_cwd=effective_cwd,
+                            lexical_cwds=lexical_cwds,
+                        )
                         continue
                     if is_pytest and not in_cov_prefix and flag_name == "--rootdir":
-                        self._validate_pytest_rootdir(flag_val, command)
+                        self._validate_pytest_rootdir(flag_val, command, base_dir=effective_cwd)
                         continue
                     candidates = [flag_val]
                     if ":" in flag_val and not (len(flag_val) >= 2 and flag_val[1] == ":"):
@@ -1469,20 +1670,26 @@ class RolePolicy:
                         if "/" in cand or "\\" in cand or ".." in cand or Path(cand).is_absolute():
                             file_part = cand.split("::", 1)[0]
                             if file_part:
-                                self._resolve_and_check_containment(file_part, "read")
+                                self._resolve_and_check_containment(
+                                    file_part, "read", base_dir=effective_cwd
+                                )
                 elif len(tok) > 2 and not tok.startswith("--"):
                     attached = tok[2:]
                     if "/" in attached or "\\" in attached or ".." in attached:
                         file_part = attached.split("::", 1)[0]
                         if file_part:
-                            self._resolve_and_check_containment(file_part, "read")
+                            self._resolve_and_check_containment(
+                                file_part, "read", base_dir=effective_cwd
+                            )
                 continue
 
             if "/" in tok or "\\" in tok or ".." in tok or Path(tok).is_absolute():
                 # Allow pytest nodeids like tests/test_a.py::test_fn by stripping ::nodeid
                 file_part = tok.split("::", 1)[0]
                 if file_part:
-                    self._resolve_and_check_containment(file_part, "read")
+                    self._resolve_and_check_containment(
+                        file_part, "read", base_dir=effective_cwd
+                    )
 
         if expect_write_flag is not None:
             raise ScopeViolationError(
@@ -1514,7 +1721,12 @@ class RolePolicy:
             )
 
         if is_pytest and not in_pytest_addopts and not has_explicit_pytest_cfg:
-            self._validate_pytest_implicit_configs(pytest_positional_args, command)
+            self._validate_pytest_implicit_configs(
+                pytest_positional_args,
+                command,
+                effective_cwd=effective_cwd,
+                lexical_cwds=lexical_cwds,
+            )
 
         if is_ruff_mutating:
             ruff_targets: list[str] = []
@@ -1544,7 +1756,7 @@ class RolePolicy:
             if not ruff_targets:
                 ruff_targets = ["."]
             for r_target in ruff_targets:
-                resolved_target = self.enforce_write(r_target)
+                resolved_target = self.enforce_write(r_target, base_dir=effective_cwd)
                 rel_norm = (
                     resolved_target.relative_to(self.worktree_root).as_posix().rstrip("/")
                 )
@@ -1572,13 +1784,17 @@ class RolePolicy:
 
         return tokens
 
-    def _validate_pytest_rootdir(self, rootdir_val: str, command: str) -> None:
+    def _validate_pytest_rootdir(
+        self, rootdir_val: str, command: str, *, base_dir: Path | None = None
+    ) -> None:
         raw_rd = rootdir_val.strip()
         if not raw_rd:
             raise ScopeViolationError(
                 self.role, "shell", command, "Missing path for pytest '--rootdir' flag"
             )
-        resolved_rd, _ = self._resolve_and_check_containment(raw_rd, "read")
+        resolved_rd, _ = self._resolve_and_check_containment(
+            raw_rd, "read", base_dir=base_dir
+        )
         if resolved_rd != self.worktree_root:
             raise ScopeViolationError(
                 self.role,
@@ -1588,7 +1804,13 @@ class RolePolicy:
             )
 
     def _validate_pytest_config_options(
-        self, opts: dict[str, Any], command: str, cfg: str
+        self,
+        opts: dict[str, Any],
+        command: str,
+        cfg: str,
+        *,
+        effective_cwd: Path | None = None,
+        lexical_cwds: list[Path] | None = None,
     ) -> None:
         for raw_key, raw_val in opts.items():
             key_lower = str(raw_key).strip().lower()
@@ -1618,6 +1840,8 @@ class RolePolicy:
                     command,
                     in_pytest_addopts=False,
                     from_config_file=True,
+                    effective_cwd=effective_cwd,
+                    lexical_cwds=lexical_cwds,
                 )
             elif key_lower in ("testpaths", "pythonpath", "norecursedirs") and isinstance(
                 raw_val, (list, tuple)
@@ -1635,6 +1859,8 @@ class RolePolicy:
                         command,
                         in_pytest_addopts=False,
                         from_config_file=True,
+                        effective_cwd=effective_cwd,
+                        lexical_cwds=lexical_cwds,
                     )
             elif isinstance(raw_val, str):
                 self._check_pytest_override_ini(
@@ -1642,6 +1868,8 @@ class RolePolicy:
                     command,
                     in_pytest_addopts=False,
                     from_config_file=True,
+                    effective_cwd=effective_cwd,
+                    lexical_cwds=lexical_cwds,
                 )
             elif raw_val is not None:
                 raise ScopeViolationError(
@@ -1661,145 +1889,182 @@ class RolePolicy:
             return False
 
     def _validate_pytest_implicit_configs(
-        self, positional_args: list[str], command: str
+        self,
+        positional_args: list[str],
+        command: str,
+        *,
+        effective_cwd: Path | None = None,
+        lexical_cwds: list[Path] | None = None,
     ) -> None:
-        checked_dirs: set[Path] = set()
+        if effective_cwd is None:
+            effective_cwd = self.worktree_root
+        if lexical_cwds is None:
+            lexical_cwds = [effective_cwd]
+
+        start_dirs: list[Path] = []
+        for cwd_dir in (effective_cwd, *lexical_cwds):
+            if cwd_dir != self.worktree_root and cwd_dir not in start_dirs:
+                start_dirs.append(cwd_dir)
+
+        anchors: list[Path] = [effective_cwd]
+        for lc in lexical_cwds:
+            if lc not in anchors:
+                anchors.append(lc)
+
         for raw_arg in positional_args:
             file_part = raw_arg.split("::", 1)[0].strip()
             if not file_part:
                 continue
-            resolved_pos, _ = self._resolve_and_check_containment(file_part, "read")
+            resolved_pos, _ = self._resolve_and_check_containment(
+                file_part, "read", base_dir=effective_cwd
+            )
+            res_start = resolved_pos if resolved_pos.is_dir() else resolved_pos.parent
+            if res_start not in start_dirs:
+                start_dirs.append(res_start)
 
-            start_dirs: list[Path] = [
-                resolved_pos if resolved_pos.is_dir() else resolved_pos.parent
-            ]
-            if "://" not in file_part and not file_part.lower().startswith("file:"):
-                raw_p = Path(file_part)
-                if not raw_p.is_absolute():
-                    lexical_pos = Path(os.path.normpath(self.worktree_root / raw_p))
-                    try:
-                        lexical_pos.relative_to(self.worktree_root)
-                    except ValueError:
-                        pass
-                    else:
-                        lex_start = (
-                            lexical_pos
-                            if (
-                                lexical_pos.exists()
-                                and lexical_pos.is_dir()
-                                and not lexical_pos.is_symlink()
-                            )
-                            else lexical_pos.parent
-                        )
-                        if lex_start not in start_dirs:
-                            start_dirs.append(lex_start)
+            for lexical_pos in self._compute_lexical_paths(file_part, anchors=anchors):
+                lex_start = (
+                    lexical_pos
+                    if (
+                        lexical_pos.exists()
+                        and lexical_pos.is_dir()
+                        and not lexical_pos.is_symlink()
+                    )
+                    else lexical_pos.parent
+                )
+                if lex_start not in start_dirs:
+                    start_dirs.append(lex_start)
 
-            for start_dir in start_dirs:
-                cur = start_dir
-                while cur != self.worktree_root and cur.parent != cur:
-                    try:
-                        cur.relative_to(self.worktree_root)
-                    except ValueError:
-                        break
-                    if cur in checked_dirs:
-                        break
-                    checked_dirs.add(cur)
-                    for cfg_name in _PYTEST_CONFIG_FILENAMES:
-                        cand = cur / cfg_name
-                        if not (cand.is_symlink() or cand.exists()):
-                            continue
-                        rel_disp = cand.relative_to(self.worktree_root).as_posix()
-                        if cand.is_symlink():
-                            raise ScopeViolationError(
-                                self.role,
-                                "shell",
-                                command,
-                                f"Symlink pytest config {rel_disp!r} in subdirectory is disallowed",
-                            )
-                        if cfg_name in ("pytest.toml", ".pytest.toml", "pytest.ini"):
-                            raise ScopeViolationError(
-                                self.role,
-                                "shell",
-                                command,
-                                f"Implicit subdirectory pytest config {rel_disp!r} is disallowed",
-                            )
-                        if not cand.is_file():
-                            raise ScopeViolationError(
-                                self.role,
-                                "shell",
-                                command,
-                                f"Non-regular subdirectory config path {rel_disp!r} is disallowed",
-                            )
-                        if self._is_path_writable(cand):
-                            raise ScopeViolationError(
-                                self.role,
-                                "shell",
-                                command,
-                                f"Worker-writable subdirectory config {rel_disp!r} cannot be implicitly loaded by pytest",
-                            )
-                        if cfg_name == "pyproject.toml":
-                            try:
-                                data = tomllib.loads(cand.read_text(encoding="utf-8"))
-                            except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
-                                raise ScopeViolationError(
-                                    self.role,
-                                    "shell",
-                                    command,
-                                    f"Unreadable or malformed subdirectory config {rel_disp!r}: {exc}",
-                                ) from exc
-                            tool = data.get("tool")
-                            has_pytest = "pytest" in data or (
-                                isinstance(tool, dict) and "pytest" in tool
-                            )
-                            if has_pytest or (tool is not None and not isinstance(tool, dict)):
-                                raise ScopeViolationError(
-                                    self.role,
-                                    "shell",
-                                    command,
-                                    f"Subdirectory pytest config in {rel_disp!r} is disallowed",
-                                )
-                        else:
-                            parser = configparser.RawConfigParser(allow_no_value=True)
-                            try:
-                                parser.read_string(cand.read_text(encoding="utf-8"))
-                            except (OSError, UnicodeDecodeError, configparser.Error) as exc:
-                                raise ScopeViolationError(
-                                    self.role,
-                                    "shell",
-                                    command,
-                                    f"Unreadable or malformed subdirectory config {rel_disp!r}: {exc}",
-                                ) from exc
-                            if parser.has_section("pytest") or parser.has_section("tool:pytest"):
-                                raise ScopeViolationError(
-                                    self.role,
-                                    "shell",
-                                    command,
-                                    f"Subdirectory pytest config in {rel_disp!r} is disallowed",
-                                )
+        checked_dirs: set[Path] = set()
+        for start_dir in start_dirs:
+            cur = start_dir
+            while cur != self.worktree_root and cur.parent != cur:
+                try:
+                    cur.relative_to(self.worktree_root)
+                except ValueError:
+                    break
+                if cur in checked_dirs:
+                    break
+                checked_dirs.add(cur)
+                if cur.is_symlink() and cur.resolve(strict=False) == self.worktree_root:
                     cur = cur.parent
+                    continue
+                for cfg_name in _PYTEST_CONFIG_FILENAMES:
+                    cand = cur / cfg_name
+                    if not (cand.is_symlink() or cand.exists()):
+                        continue
+                    rel_disp = cand.relative_to(self.worktree_root).as_posix()
+                    if cand.is_symlink():
+                        raise ScopeViolationError(
+                            self.role,
+                            "shell",
+                            command,
+                            f"Symlink pytest config {rel_disp!r} in subdirectory is disallowed",
+                        )
+                    if cfg_name in ("pytest.toml", ".pytest.toml", "pytest.ini"):
+                        raise ScopeViolationError(
+                            self.role,
+                            "shell",
+                            command,
+                            f"Implicit subdirectory pytest config {rel_disp!r} is disallowed",
+                        )
+                    if not cand.is_file():
+                        raise ScopeViolationError(
+                            self.role,
+                            "shell",
+                            command,
+                            f"Non-regular subdirectory config path {rel_disp!r} is disallowed",
+                        )
+                    if self._is_path_writable(cand):
+                        raise ScopeViolationError(
+                            self.role,
+                            "shell",
+                            command,
+                            f"Worker-writable subdirectory config {rel_disp!r} cannot be implicitly loaded by pytest",
+                        )
+                    if cfg_name == "pyproject.toml":
+                        try:
+                            data = tomllib.loads(cand.read_text(encoding="utf-8"))
+                        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+                            raise ScopeViolationError(
+                                self.role,
+                                "shell",
+                                command,
+                                f"Unreadable or malformed subdirectory config {rel_disp!r}: {exc}",
+                            ) from exc
+                        tool = data.get("tool")
+                        has_pytest = "pytest" in data or (
+                            isinstance(tool, dict) and "pytest" in tool
+                        )
+                        if has_pytest or (tool is not None and not isinstance(tool, dict)):
+                            raise ScopeViolationError(
+                                self.role,
+                                "shell",
+                                command,
+                                f"Subdirectory pytest config in {rel_disp!r} is disallowed",
+                            )
+                    else:
+                        parser = configparser.RawConfigParser(allow_no_value=True)
+                        try:
+                            parser.read_string(cand.read_text(encoding="utf-8"))
+                        except (OSError, UnicodeDecodeError, configparser.Error) as exc:
+                            raise ScopeViolationError(
+                                self.role,
+                                "shell",
+                                command,
+                                f"Unreadable or malformed subdirectory config {rel_disp!r}: {exc}",
+                            ) from exc
+                        if parser.has_section("pytest") or parser.has_section("tool:pytest"):
+                            raise ScopeViolationError(
+                                self.role,
+                                "shell",
+                                command,
+                                f"Subdirectory pytest config in {rel_disp!r} is disallowed",
+                            )
+                cur = cur.parent
 
         for cfg_name in _PYTEST_CONFIG_FILENAMES:
             root_cfg = self.worktree_root / cfg_name
             if root_cfg.is_symlink() or root_cfg.exists():
-                self._validate_pytest_config_file(cfg_name, command)
+                self._validate_pytest_config_file(
+                    cfg_name,
+                    command,
+                    base_dir=self.worktree_root,
+                    effective_cwd=effective_cwd,
+                    lexical_cwds=lexical_cwds,
+                )
 
-    def _validate_pytest_config_file(self, cfg: str, command: str) -> None:
+    def _validate_pytest_config_file(
+        self,
+        cfg: str,
+        command: str,
+        *,
+        base_dir: Path | None = None,
+        effective_cwd: Path | None = None,
+        lexical_cwds: list[Path] | None = None,
+    ) -> None:
         raw_cfg = cfg.strip()
         if not raw_cfg:
             raise ScopeViolationError(
                 self.role, "shell", command, "Missing path for pytest config flag"
             )
-        resolved_cfg, _ = self._resolve_and_check_containment(raw_cfg, "read")
-        if "://" not in raw_cfg and not raw_cfg.lower().startswith("file:"):
-            p_raw = Path(raw_cfg)
-            cand_cfg = p_raw if p_raw.is_absolute() else (self.worktree_root / p_raw)
-            if cand_cfg.is_symlink():
-                raise ScopeViolationError(
-                    self.role,
-                    "shell",
-                    command,
-                    f"Pytest config path {cfg!r} cannot be a symlink",
-                )
+        anchor = base_dir if base_dir is not None else self.worktree_root
+        resolved_cfg, _ = self._resolve_and_check_containment(
+            raw_cfg, "read", base_dir=anchor
+        )
+        local_cfg = raw_cfg
+        if "://" in raw_cfg or raw_cfg.lower().startswith("file:"):
+            parsed = urlsplit(raw_cfg)
+            local_cfg = url2pathname(parsed.path)
+        p_raw = Path(local_cfg)
+        cand_cfg = Path(os.path.normpath(p_raw if p_raw.is_absolute() else (anchor / p_raw)))
+        if cand_cfg.is_symlink():
+            raise ScopeViolationError(
+                self.role,
+                "shell",
+                command,
+                f"Pytest config path {cfg!r} cannot be a symlink",
+            )
         if (
             resolved_cfg.parent != self.worktree_root
             or resolved_cfg.name not in _ALLOWED_PYTEST_ROOT_CONFIGS
@@ -1881,7 +2146,13 @@ class RolePolicy:
                         sections_to_check.append(direct_opts)
 
             for opts in sections_to_check:
-                self._validate_pytest_config_options(opts, command, cfg)
+                self._validate_pytest_config_options(
+                    opts,
+                    command,
+                    cfg,
+                    effective_cwd=effective_cwd,
+                    lexical_cwds=lexical_cwds,
+                )
             return
 
         parser = configparser.RawConfigParser(allow_no_value=True)
@@ -1899,7 +2170,11 @@ class RolePolicy:
         for sec_name in ("pytest", "tool:pytest"):
             if parser.has_section(sec_name):
                 self._validate_pytest_config_options(
-                    dict(parser.items(sec_name)), command, cfg
+                    dict(parser.items(sec_name)),
+                    command,
+                    cfg,
+                    effective_cwd=effective_cwd,
+                    lexical_cwds=lexical_cwds,
                 )
 
     def _check_pytest_override_ini(
@@ -1909,7 +2184,14 @@ class RolePolicy:
         *,
         in_pytest_addopts: bool = False,
         from_config_file: bool = False,
+        effective_cwd: Path | None = None,
+        lexical_cwds: list[Path] | None = None,
     ) -> None:
+        if effective_cwd is None:
+            effective_cwd = self.worktree_root
+        if lexical_cwds is None:
+            lexical_cwds = [effective_cwd]
+
         if "=" in val:
             ini_key, ini_val = val.split("=", 1)
             key_lower = ini_key.strip().lower()
@@ -1973,6 +2255,8 @@ class RolePolicy:
                     command,
                     check_prefix=False,
                     in_pytest_addopts=True,
+                    effective_cwd=effective_cwd,
+                    lexical_cwds=lexical_cwds,
                 )
                 return
             if key_lower in ("log_file", "cache_dir", "basetemp", "resultlog"):
@@ -1983,7 +2267,7 @@ class RolePolicy:
                         command,
                         f"Read-only role cannot override pytest ini {ini_key!r}",
                     )
-                self.enforce_write(ini_val.strip())
+                self.enforce_write(ini_val.strip(), base_dir=effective_cwd)
                 return
             try:
                 val_segments = shlex.split(ini_val)
@@ -1998,7 +2282,13 @@ class RolePolicy:
                     or "://" in seg
                     or seg.lower().startswith("file:")
                 ):
-                    self._resolve_and_check_containment(seg, "read")
+                    self._resolve_and_check_containment(
+                        seg, "read", base_dir=self.worktree_root
+                    )
+                    if not from_config_file and effective_cwd != self.worktree_root:
+                        self._resolve_and_check_containment(
+                            seg, "read", base_dir=effective_cwd
+                        )
 
     def _extract_tool_paths(
         self,
@@ -2099,9 +2389,6 @@ class RolePolicy:
             return
 
         if norm_name in _SHELL_TOOLS or any(k in norm_name for k in ("bash", "shell", "exec")):
-            cwd_val = args.get("cwd") or args.get("working_directory") or args.get("workingDirectory")
-            if isinstance(cwd_val, str) and cwd_val.strip():
-                self.enforce_read(cwd_val.strip())
             cmd_val: str | None = None
             for key in _SHELL_CMD_KEYS:
                 val = args.get(key)
@@ -2117,7 +2404,8 @@ class RolePolicy:
                     tool_name,
                     "Shell tool call missing command argument (fail closed)",
                 )
-            self.enforce_shell(cmd_val)
+            cwd_val = self._validate_shell_cwd_mapping(args, cmd_val)
+            self.enforce_shell(cmd_val, cwd=cwd_val)
             return
 
         if norm_name in _READ_TOOLS:
@@ -2201,6 +2489,41 @@ def _run_pre_tool_use_hook() -> int:
     tool_args = payload.get("toolArgs") if "toolArgs" in payload else payload.get("tool_args")
 
     try:
+        if isinstance(payload, dict):
+            top_cwds = {
+                k: payload[k]
+                for k in _SHELL_CWD_KEYS
+                if k in payload and payload[k] is not None
+            }
+            if top_cwds:
+                if isinstance(tool_args, str):
+                    try:
+                        parsed_args = json.loads(tool_args)
+                    except json.JSONDecodeError:
+                        parsed_args = {"raw": tool_args}
+                    effective_args: dict[str, Any] = (
+                        dict(parsed_args)
+                        if isinstance(parsed_args, dict)
+                        else {"raw": tool_args}
+                    )
+                elif isinstance(tool_args, dict):
+                    effective_args = dict(tool_args)
+                else:
+                    effective_args = {}
+
+                for k, v in top_cwds.items():
+                    if k in effective_args and effective_args[k] is not None:
+                        if str(effective_args[k]).strip() != str(v).strip():
+                            raise ScopeViolationError(
+                                policy.role,
+                                "shell",
+                                str(effective_args.get("command") or tool_name),
+                                f"Conflicting working directory between hook payload and toolArgs for {k!r}",
+                            )
+                    else:
+                        effective_args[k] = v
+                tool_args = effective_args
+
         policy.enforce_tool_call(tool_name, tool_args)
     except ScopeViolationError as err:
         if sentinel_path:

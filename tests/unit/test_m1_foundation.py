@@ -2746,3 +2746,364 @@ def test_sdk_shell_resolved_paths_content_and_type_key_shadowing(tmp_path: Path)
     assert getattr(ok_dec, "kind", None) == "approve-once", (
         f"Expected approve-once for valid resolved_paths, got {ok_dec!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 15. Iteration 9 Regression Tests (R8 Verifier Findings 1-3)
+# ---------------------------------------------------------------------------
+
+
+def test_pytest_non_core_plugin_flags_do_not_skip_positional_args(tmp_path: Path) -> None:
+    """Verify --anyio-mode and -n do not skip following test paths in _validate_pytest_implicit_configs."""
+    from copilot.generated.session_events import PermissionRequestShell
+
+    wt = tmp_path / "wt"
+    (wt / "tests" / "unit").mkdir(parents=True)
+    (wt / ".thread").mkdir(parents=True)
+    (wt / ".thread" / "policy.yaml").write_text("base_branch: main\n", encoding="utf-8")
+    (wt / "tests" / "unit" / "test_ok.py").write_text("def test_ok(): pass\n", encoding="utf-8")
+    (wt / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\n[tool.pytest.ini_options]\naddopts = "-v"\n',
+        encoding="utf-8",
+    )
+    (wt / "tests" / "pytest.ini").write_text(
+        "[pytest]\naddopts = --log-file=.thread/policy.yaml\n", encoding="utf-8"
+    )
+
+    be = RolePolicy(
+        role="backend",
+        worktree_root=wt,
+        allowed_paths=["app/**", "tests/**"],
+        denied_paths=[".thread/policy.yaml", ".thread/**"],
+        allowed_shell_prefixes=["pytest", "python"],
+    )
+    ver = RolePolicy(
+        role="verifier",
+        worktree_root=wt,
+        allowed_paths=["tests/**"],
+        denied_paths=[".thread/policy.yaml", ".thread/**"],
+        allowed_shell_prefixes=["pytest", "python"],
+    )
+    ro = RolePolicy(
+        role="reviewer_readonly",
+        worktree_root=wt,
+        allowed_paths=[],
+        denied_paths=["**"],
+        allowed_shell_prefixes=["pytest", "python"],
+        readonly=True,
+    )
+    sdk_ver = CopilotSdkAdapter(ver)
+
+    for cmd in (
+        "pytest --anyio-mode tests/unit/test_ok.py",
+        "pytest --anyio-mode strict tests/unit/test_ok.py",
+        "pytest --anyio-mode=strict tests/unit/test_ok.py",
+        "pytest -n 2 tests/unit/test_ok.py",
+        "pytest -n tests/unit/test_ok.py",
+        "pytest -vn 2 tests/unit/test_ok.py",
+        "python -m pytest --anyio-mode tests/unit/test_ok.py",
+        "python -m coverage run -m pytest --anyio-mode tests/unit/test_ok.py",
+    ):
+        for pol in (be, ver, ro):
+            with pytest.raises(ScopeViolationError):
+                pol.enforce_shell(cmd)
+        hook_proc = subprocess.run(
+            [sys.executable, "-m", "thread_sdlc.workers.permissions"],
+            input=json.dumps({"toolName": "bash", "toolArgs": {"command": cmd}}),
+            env={**os.environ, "THREAD_POLICY_JSON": json.dumps(ver.to_dict())},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert json.loads(hook_proc.stdout)["permissionDecision"] == "deny"
+        sdk_dec = asyncio.run(
+            sdk_ver._on_permission_request(
+                PermissionRequestShell(
+                    can_offer_session_approval=False,
+                    commands=[],
+                    full_command_text=cmd,
+                    has_write_file_redirection=False,
+                    intention="run tests",
+                    possible_paths=[],
+                    possible_urls=[],
+                )
+            )
+        )
+        assert getattr(sdk_dec, "kind", None) == "denied-by-rules"
+
+    # Non-regression when no subdir config exists
+    (wt / "tests" / "pytest.ini").unlink()
+    for ok_cmd in (
+        "pytest --anyio-mode=strict tests/unit/test_ok.py",
+        "pytest --anyio-mode strict tests/unit/test_ok.py",
+        "pytest -n 2 tests/unit/test_ok.py",
+        "pytest -k test_ok tests/unit/test_ok.py",
+    ):
+        assert be.enforce_shell(ok_cmd)
+        assert ver.enforce_shell(ok_cmd)
+        assert ro.enforce_shell(ok_cmd)
+
+
+def test_subdir_cwd_enforced_across_shell_tool_cli_and_sdk(tmp_path: Path) -> None:
+    """Verify subdirectory cwd/working_directory/resolved_working_directory cannot bypass pytest or path checks."""
+    from copilot.generated.session_events import PermissionRequestShell
+
+    wt = tmp_path / "wt"
+    (wt / "app").mkdir(parents=True)
+    (wt / "tests" / "unit").mkdir(parents=True)
+    (wt / "subpkg" / "tests").mkdir(parents=True)
+    (wt / ".thread").mkdir(parents=True)
+    (wt / ".thread" / "policy.yaml").write_text("base_branch: main\n", encoding="utf-8")
+    (wt / "app" / "main.py").write_text("x = 1\n", encoding="utf-8")
+    (wt / "tests" / "unit" / "test_ok.py").write_text("def test_ok(): pass\n", encoding="utf-8")
+    (wt / "subpkg" / "tests" / "test_sub.py").write_text("def test_sub(): pass\n", encoding="utf-8")
+    (wt / "tests" / "link").symlink_to(wt / "subpkg" / "tests")
+    (wt / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\n[tool.pytest.ini_options]\ntestpaths = ["tests"]\naddopts = "-v"\n',
+        encoding="utf-8",
+    )
+
+    be = RolePolicy(
+        role="backend",
+        worktree_root=wt,
+        allowed_paths=["app/**", "tests/**"],
+        denied_paths=[".thread/policy.yaml", ".thread/**"],
+        allowed_shell_prefixes=["pytest", "python"],
+    )
+    ver = RolePolicy(
+        role="verifier",
+        worktree_root=wt,
+        allowed_paths=["tests/**"],
+        denied_paths=[".thread/policy.yaml", ".thread/**"],
+        allowed_shell_prefixes=["pytest", "python"],
+    )
+    ro = RolePolicy(
+        role="reviewer_readonly",
+        worktree_root=wt,
+        allowed_paths=[],
+        denied_paths=["**"],
+        allowed_shell_prefixes=["pytest", "python"],
+        readonly=True,
+    )
+    sdk_ver = CopilotSdkAdapter(ver)
+
+    subdir_configs: list[tuple[str, str]] = [
+        ("tests/pytest.ini", "[pytest]\naddopts = --log-file=../.thread/policy.yaml\n"),
+        ("tests/pytest.toml", '[pytest]\naddopts = ["--log-file=../.thread/policy.yaml"]\n'),
+        ("tests/.pytest.toml", '[pytest]\naddopts = ["--log-file=../.thread/policy.yaml"]\n'),
+        ("tests/tox.ini", "[pytest]\naddopts = --log-file=../.thread/policy.yaml\n"),
+        ("tests/setup.cfg", "[tool:pytest]\naddopts = --log-file=../.thread/policy.yaml\n"),
+        (
+            "tests/pyproject.toml",
+            '[tool.pytest.ini_options]\naddopts = ["--log-file=../.thread/policy.yaml"]\n',
+        ),
+    ]
+    for rel_cfg, content in subdir_configs:
+        cfg_path = wt / rel_cfg
+        cfg_path.write_text(content, encoding="utf-8")
+        try:
+            attack_cases: list[tuple[str, str]] = [
+                ("tests", "pytest"),
+                ("tests", "pytest -c pyproject.toml"),
+                ("tests/unit", "pytest test_ok.py"),
+                ("tests", "pytest --rootdir=. unit/test_ok.py"),
+                ("tests", "pytest --log-file=../.thread/policy.yaml"),
+                ("tests/link", "pytest"),
+            ]
+            for cwd_rel, cmd in attack_cases:
+                for pol in (be, ver, ro):
+                    with pytest.raises(ScopeViolationError):
+                        pol.enforce_shell(cmd, cwd=cwd_rel)
+                    with pytest.raises(ScopeViolationError):
+                        pol.enforce_tool_call("bash", {"command": cmd, "cwd": cwd_rel})
+                hook_proc = subprocess.run(
+                    [sys.executable, "-m", "thread_sdlc.workers.permissions"],
+                    input=json.dumps(
+                        {"toolName": "bash", "toolArgs": {"command": cmd, "cwd": cwd_rel}}
+                    ),
+                    env={**os.environ, "THREAD_POLICY_JSON": json.dumps(ver.to_dict())},
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                assert json.loads(hook_proc.stdout)["permissionDecision"] == "deny"
+
+                sdk_req = PermissionRequestShell(
+                    can_offer_session_approval=False,
+                    commands=[],
+                    full_command_text=cmd,
+                    has_write_file_redirection=False,
+                    intention="run tests",
+                    possible_paths=[],
+                    possible_urls=[],
+                    resolved_working_directory=str(wt / cwd_rel),
+                )
+                sdk_dec = asyncio.run(sdk_ver._on_permission_request(sdk_req))
+                assert getattr(sdk_dec, "kind", None) == "denied-by-rules"
+
+                sdk_dict_dec = asyncio.run(
+                    sdk_ver._on_permission_request(
+                        {
+                            "kind": "shell",
+                            "fullCommandText": cmd,
+                            "working_directory": cwd_rel,
+                            "resolved_working_directory": str((wt / cwd_rel).resolve()),
+                        }
+                    )
+                )
+                assert sdk_dict_dec["kind"] == "denied-by-rules"
+        finally:
+            cfg_path.unlink()
+
+    # Conflicting, missing, file-target, empty, and out-of-bounds cwd must fail closed
+    for bad_args in (
+        {"command": "pytest", "working_directory": "app", "resolved_working_directory": str(wt / "tests")},
+        {"command": "pytest", "cwd": "app", "workingDirectory": "tests"},
+        {"command": "pytest", "cwd": "does_not_exist"},
+        {"command": "pytest", "cwd": "app/main.py"},
+        {"command": "pytest", "cwd": ""},
+        {"command": "pytest", "cwd": "/etc"},
+    ):
+        with pytest.raises(ScopeViolationError):
+            ver.enforce_tool_call("bash", bad_args)
+        sdk_bad = asyncio.run(
+            sdk_ver._on_permission_request(
+                {"kind": "shell", "fullCommandText": bad_args["command"], **{k: v for k, v in bad_args.items() if k != "command"}}
+            )
+        )
+        assert sdk_bad["kind"] == "denied-by-rules"
+
+    # Relative possible_paths with write redirection resolves against cwd (app-only role rejects tests/out.txt)
+    app_only = RolePolicy(
+        role="backend",
+        worktree_root=wt,
+        allowed_paths=["app/**"],
+        denied_paths=[".thread/**"],
+        allowed_shell_prefixes=["pytest"],
+    )
+    sdk_app_only = CopilotSdkAdapter(app_only)
+    redir_dec = asyncio.run(
+        sdk_app_only._on_permission_request(
+            PermissionRequestShell(
+                can_offer_session_approval=False,
+                commands=[],
+                full_command_text="pytest",
+                has_write_file_redirection=True,
+                intention="redirect",
+                possible_paths=["out.txt"],
+                possible_urls=[],
+                resolved_working_directory=str(wt / "tests"),
+            )
+        )
+    )
+    assert getattr(redir_dec, "kind", None) == "denied-by-rules"
+
+    # Legitimate subdir cwd passes cleanly when no subdir config exists
+    assert ver.enforce_shell("pytest", cwd="tests")
+    assert ver.enforce_shell("pytest -c ../pyproject.toml", cwd="tests")
+    assert ver.enforce_shell("pytest test_ok.py", cwd="tests/unit")
+    assert ver.enforce_shell("pytest tests/unit/test_ok.py", cwd=".")
+    ver.enforce_tool_call(
+        "bash",
+        {
+            "command": "pytest unit/test_ok.py",
+            "working_directory": "tests",
+            "resolved_working_directory": str(wt / "tests"),
+        },
+    )
+    ok_sdk_dec = asyncio.run(
+        sdk_ver._on_permission_request(
+            PermissionRequestShell(
+                can_offer_session_approval=False,
+                commands=[],
+                full_command_text="pytest unit/test_ok.py",
+                has_write_file_redirection=False,
+                intention="run tests",
+                possible_paths=[],
+                possible_urls=[],
+                resolved_working_directory=str(wt / "tests"),
+            )
+        )
+    )
+    assert getattr(ok_sdk_dec, "kind", None) == "approve-once"
+
+
+def test_pytest_absolute_and_file_uri_symlink_lexical_ancestor_check(tmp_path: Path) -> None:
+    """Verify absolute-path and file:// URI symlink positional args check lexical ancestor configs."""
+    from copilot.generated.session_events import PermissionRequestShell
+
+    real_parent = tmp_path / "real_parent"
+    alias_parent = tmp_path / "alias_parent"
+    real_parent.mkdir()
+    alias_parent.symlink_to(real_parent)
+
+    wt = real_parent / "wt"
+    (wt / "tests").mkdir(parents=True)
+    (wt / "subpkg" / "tests").mkdir(parents=True)
+    (wt / ".thread").mkdir(parents=True)
+    (wt / ".thread" / "policy.yaml").write_text("base_branch: main\n", encoding="utf-8")
+    (wt / "subpkg" / "pyproject.toml").write_text('[project]\nname = "subpkg"\n', encoding="utf-8")
+    (wt / "subpkg" / "tests" / "test_sub.py").write_text("def test_sub(): pass\n", encoding="utf-8")
+    (wt / "tests" / "link").symlink_to(wt / "subpkg" / "tests")
+    (wt / "tests" / "pytest.ini").write_text(
+        "[pytest]\naddopts = --log-file=.thread/policy.yaml\n", encoding="utf-8"
+    )
+
+    ver = RolePolicy(
+        role="verifier",
+        worktree_root=wt,
+        allowed_paths=["tests/**"],
+        denied_paths=[".thread/policy.yaml", ".thread/**"],
+        allowed_shell_prefixes=["pytest", "python"],
+    )
+    ro = RolePolicy(
+        role="reviewer_readonly",
+        worktree_root=wt,
+        allowed_paths=[],
+        denied_paths=["**"],
+        allowed_shell_prefixes=["pytest", "python"],
+        readonly=True,
+    )
+    sdk_ver = CopilotSdkAdapter(ver)
+
+    alias_wt = alias_parent / "wt"
+    for cmd in (
+        f"pytest {wt}/tests/link/test_sub.py",
+        f"pytest {wt}/tests/link/test_sub.py::test_sub",
+        f"pytest file://{wt}/tests/link/test_sub.py",
+        f"pytest {wt}/tests/link",
+        f"pytest {alias_wt}/tests/link/test_sub.py",
+        "pytest tests/link/test_sub.py",
+    ):
+        for pol in (ver, ro):
+            with pytest.raises(ScopeViolationError):
+                pol.enforce_shell(cmd)
+        hook_proc = subprocess.run(
+            [sys.executable, "-m", "thread_sdlc.workers.permissions"],
+            input=json.dumps({"toolName": "bash", "toolArgs": {"command": cmd}}),
+            env={**os.environ, "THREAD_POLICY_JSON": json.dumps(ver.to_dict())},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert json.loads(hook_proc.stdout)["permissionDecision"] == "deny"
+        sdk_dec = asyncio.run(
+            sdk_ver._on_permission_request(
+                PermissionRequestShell(
+                    can_offer_session_approval=False,
+                    commands=[],
+                    full_command_text=cmd,
+                    has_write_file_redirection=False,
+                    intention="run tests",
+                    possible_paths=[],
+                    possible_urls=[],
+                )
+            )
+        )
+        assert getattr(sdk_dec, "kind", None) == "denied-by-rules"
+
+    # Non-regression when tests/pytest.ini is absent
+    (wt / "tests" / "pytest.ini").unlink()
+    assert ver.enforce_shell(f"pytest {wt}/tests/link/test_sub.py")
+    assert ver.enforce_shell(f"pytest file://{wt}/tests/link/test_sub.py")
+    assert ro.enforce_shell(f"pytest {wt}/tests/link/test_sub.py")
