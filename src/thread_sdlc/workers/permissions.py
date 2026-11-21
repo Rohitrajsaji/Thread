@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import configparser
 import fnmatch
 import json
 import os
 import shlex
 import sys
+import tomllib
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -186,6 +188,21 @@ _PATH_LIST_KEYS = frozenset(
 )
 
 _PYTEST_VALUE_SHORT_FLAGS = frozenset({"k", "m", "c", "r", "W", "n", "p"})
+
+_ALLOWED_PYTEST_ROOT_CONFIGS = frozenset({"pyproject.toml", "pytest.ini", "tox.ini", "setup.cfg"})
+
+_PYTEST_INSPECTED_INI_KEYS = frozenset(
+    {
+        "addopts",
+        "log_file",
+        "cache_dir",
+        "basetemp",
+        "resultlog",
+        "testpaths",
+        "pythonpath",
+        "norecursedirs",
+    }
+)
 
 _READ_EXTRA_PATH_KEYS = frozenset(
     {
@@ -378,6 +395,31 @@ def _has_pytest_c_flag(tok: str) -> bool:
         if ch in _PYTEST_VALUE_SHORT_FLAGS or ch == "o":
             return False
     return False
+
+
+def _parse_bundled_pytest_c(tok: str) -> tuple[bool, str | None, bool]:
+    """Inspect a short pytest option cluster like ``-qc`` or ``-vc<path>``.
+
+    Returns ``(found_c, attached_val_or_none, has_empty_equals)``.
+    Stops scanning at value-taking short options (``k, m, r, W, n, p`` and ``o``)
+    so expressions like ``-kc`` or ``-oc`` are never mistaken for ``-c``.
+    """
+    if not tok.startswith("-") or tok.startswith("--") or len(tok) <= 2:
+        return False, None, False
+    chars = tok[1:]
+    value_stops = (_PYTEST_VALUE_SHORT_FLAGS - {"c"}) | {"o"}
+    for j, ch in enumerate(chars):
+        if ch in value_stops:
+            return False, None, False
+        if ch == "c":
+            rest = chars[j + 1 :]
+            if not rest:
+                return True, None, False
+            if rest.startswith("="):
+                val = rest[1:]
+                return True, val, (val == "")
+            return True, rest, False
+    return False, None, False
 
 
 def _has_unquoted_shell_metachar(command: str) -> str | None:
@@ -1038,7 +1080,13 @@ class RolePolicy:
                 raise ScopeViolationError(
                     self.role, "shell", command, "Read-only role cannot run mutating ruff command"
                 )
-            for t in tokens[1:]:
+            for idx, t in enumerate(tokens[1:], start=1):
+                in_cov_prefix = (
+                    is_coverage
+                    and python_module_end_idx is not None
+                    and idx > python_module_end_idx
+                    and (cov_nested_end_idx is None or idx <= cov_nested_end_idx)
+                )
                 t_flag = t.split("=", 1)[0]
                 if (
                     t_flag in _FILE_WRITING_FLAGS
@@ -1048,9 +1096,12 @@ class RolePolicy:
                     or (t.startswith("-o") and not t.startswith("--"))
                     or (
                         is_pytest
+                        and not in_cov_prefix
                         and (
                             t == "--override-ini"
                             or t.startswith("--override-ini=")
+                            or t == "--debug"
+                            or t.startswith("--debug=")
                             or _parse_bundled_pytest_o(t)[0]
                         )
                     )
@@ -1098,6 +1149,8 @@ class RolePolicy:
         # Ensure file-writing flags (both `--flag=path` and `--flag path`) and path-like tokens stay in scope
         expect_write_flag: str | None = None
         expect_pytest_ini = False
+        expect_pytest_cfg = False
+        expect_pytest_rootdir = False
 
         for idx, tok in enumerate(tokens[1:], start=1):
             in_cov_prefix = (
@@ -1128,6 +1181,32 @@ class RolePolicy:
                 )
                 continue
 
+            if expect_pytest_cfg:
+                expect_pytest_cfg = False
+                self._validate_pytest_config_file(tok, command)
+                continue
+
+            if expect_pytest_rootdir:
+                expect_pytest_rootdir = False
+                self._validate_pytest_rootdir(tok, command)
+                continue
+
+            if is_pytest and not in_cov_prefix and (tok == "--debug" or tok.startswith("--debug=")):
+                raise ScopeViolationError(
+                    self.role,
+                    "shell",
+                    command,
+                    f"Pytest flag {tok.split('=', 1)[0]!r} is disallowed",
+                )
+
+            if is_pytest and not in_cov_prefix and tok in ("-c", "--config-file"):
+                expect_pytest_cfg = True
+                continue
+
+            if is_pytest and not in_cov_prefix and tok == "--rootdir":
+                expect_pytest_rootdir = True
+                continue
+
             if (
                 tok in _FILE_WRITING_FLAGS
                 or (not is_pytest and tok == "-o")
@@ -1155,7 +1234,7 @@ class RolePolicy:
                 continue
 
             if tok.startswith("-"):
-                # Bundled / glued pytest `-o` clusters (`-qo`, `-vo`, `-qolog_file=...`, `-qo=...`)
+                # Bundled / glued pytest `-o` and `-c` clusters (`-qo`, `-vc<path>`, `-qc=<path>`)
                 # must be checked BEFORE `if "=" in tok:` and before falling through to `tok[2:]`.
                 if (
                     is_pytest
@@ -1163,6 +1242,20 @@ class RolePolicy:
                     and not tok.startswith("--")
                     and len(tok) > 2
                 ):
+                    found_c, attached_c, empty_c_eq = _parse_bundled_pytest_c(tok)
+                    if found_c:
+                        if empty_c_eq:
+                            raise ScopeViolationError(
+                                self.role,
+                                "shell",
+                                command,
+                                "Missing path for pytest '-c' flag",
+                            )
+                        if attached_c is None:
+                            expect_pytest_cfg = True
+                        else:
+                            self._validate_pytest_config_file(attached_c, command)
+                        continue
                     found_o, attached_o, empty_eq = _parse_bundled_pytest_o(tok)
                     if found_o:
                         if self.readonly:
@@ -1270,6 +1363,12 @@ class RolePolicy:
                             flag_val, command, in_pytest_addopts=in_pytest_addopts
                         )
                         continue
+                    if is_pytest and not in_cov_prefix and flag_name == "--config-file":
+                        self._validate_pytest_config_file(flag_val, command)
+                        continue
+                    if is_pytest and not in_cov_prefix and flag_name == "--rootdir":
+                        self._validate_pytest_rootdir(flag_val, command)
+                        continue
                     candidates = [flag_val]
                     if ":" in flag_val and not (len(flag_val) >= 2 and flag_val[1] == ":"):
                         candidates.extend(seg for seg in flag_val.split(":") if seg)
@@ -1305,6 +1404,20 @@ class RolePolicy:
                 "shell",
                 command,
                 "Missing value for pytest '-o'/'--override-ini' flag",
+            )
+        if expect_pytest_cfg:
+            raise ScopeViolationError(
+                self.role,
+                "shell",
+                command,
+                "Missing path for pytest '-c'/'--config-file' flag",
+            )
+        if expect_pytest_rootdir:
+            raise ScopeViolationError(
+                self.role,
+                "shell",
+                command,
+                "Missing path for pytest '--rootdir' flag",
             )
 
         if is_ruff_mutating:
@@ -1363,14 +1476,185 @@ class RolePolicy:
 
         return tokens
 
+    def _validate_pytest_rootdir(self, rootdir_val: str, command: str) -> None:
+        raw_rd = rootdir_val.strip()
+        if not raw_rd:
+            raise ScopeViolationError(
+                self.role, "shell", command, "Missing path for pytest '--rootdir' flag"
+            )
+        resolved_rd, _ = self._resolve_and_check_containment(raw_rd, "read")
+        if resolved_rd != self.worktree_root:
+            raise ScopeViolationError(
+                self.role,
+                "shell",
+                command,
+                f"Pytest '--rootdir' {rootdir_val!r} must resolve to worktree root",
+            )
+
+    def _validate_pytest_config_options(
+        self, opts: dict[str, Any], command: str, cfg: str
+    ) -> None:
+        for raw_key, raw_val in opts.items():
+            key_lower = str(raw_key).strip().lower()
+            if key_lower not in _PYTEST_INSPECTED_INI_KEYS:
+                continue
+            if key_lower == "addopts":
+                if isinstance(raw_val, str):
+                    addopts_str = " ".join(raw_val.replace("\r", "\n").splitlines())
+                elif isinstance(raw_val, (list, tuple)):
+                    if not all(isinstance(item, str) for item in raw_val):
+                        raise ScopeViolationError(
+                            self.role,
+                            "shell",
+                            command,
+                            f"Malformed addopts list in pytest config {cfg!r}",
+                        )
+                    addopts_str = shlex.join(raw_val)
+                else:
+                    raise ScopeViolationError(
+                        self.role,
+                        "shell",
+                        command,
+                        f"Malformed addopts value in pytest config {cfg!r}",
+                    )
+                self._check_pytest_override_ini(
+                    f"addopts={addopts_str}",
+                    command,
+                    in_pytest_addopts=False,
+                    from_config_file=True,
+                )
+            elif key_lower in ("testpaths", "pythonpath", "norecursedirs") and isinstance(
+                raw_val, (list, tuple)
+            ):
+                if not all(isinstance(item, str) for item in raw_val):
+                    raise ScopeViolationError(
+                        self.role,
+                        "shell",
+                        command,
+                        f"Malformed {key_lower!r} list in pytest config {cfg!r}",
+                    )
+                for item in raw_val:
+                    self._check_pytest_override_ini(
+                        f"{key_lower}={item}",
+                        command,
+                        in_pytest_addopts=False,
+                        from_config_file=True,
+                    )
+            elif isinstance(raw_val, str):
+                self._check_pytest_override_ini(
+                    f"{key_lower}={raw_val}",
+                    command,
+                    in_pytest_addopts=False,
+                    from_config_file=True,
+                )
+            elif raw_val is not None:
+                raise ScopeViolationError(
+                    self.role,
+                    "shell",
+                    command,
+                    f"Malformed {key_lower!r} value in pytest config {cfg!r}",
+                )
+
+    def _validate_pytest_config_file(self, cfg: str, command: str) -> None:
+        raw_cfg = cfg.strip()
+        if not raw_cfg:
+            raise ScopeViolationError(
+                self.role, "shell", command, "Missing path for pytest config flag"
+            )
+        resolved_cfg, _ = self._resolve_and_check_containment(raw_cfg, "read")
+        if (
+            resolved_cfg.parent != self.worktree_root
+            or resolved_cfg.name not in _ALLOWED_PYTEST_ROOT_CONFIGS
+        ):
+            raise ScopeViolationError(
+                self.role,
+                "shell",
+                command,
+                f"Pytest config file {cfg!r} must be a root project config {sorted(_ALLOWED_PYTEST_ROOT_CONFIGS)}",
+            )
+        if resolved_cfg.exists() and not resolved_cfg.is_file():
+            raise ScopeViolationError(
+                self.role,
+                "shell",
+                command,
+                f"Pytest config path {cfg!r} is not a regular file",
+            )
+        if not resolved_cfg.is_file():
+            return
+
+        if resolved_cfg.name == "pyproject.toml":
+            try:
+                data = tomllib.loads(resolved_cfg.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+                raise ScopeViolationError(
+                    self.role,
+                    "shell",
+                    command,
+                    f"Unreadable or malformed pytest config {cfg!r}: {exc}",
+                ) from exc
+            tool = data.get("tool")
+            if tool is None:
+                return
+            if not isinstance(tool, dict):
+                raise ScopeViolationError(
+                    self.role, "shell", command, f"Malformed [tool] table in {cfg!r}"
+                )
+            pytest_tbl = tool.get("pytest")
+            if pytest_tbl is None:
+                return
+            if not isinstance(pytest_tbl, dict):
+                raise ScopeViolationError(
+                    self.role, "shell", command, f"Malformed [tool.pytest] table in {cfg!r}"
+                )
+            sections_to_check: list[dict[str, Any]] = []
+            ini_opts = pytest_tbl.get("ini_options")
+            if ini_opts is not None:
+                if not isinstance(ini_opts, dict):
+                    raise ScopeViolationError(
+                        self.role,
+                        "shell",
+                        command,
+                        f"Malformed [tool.pytest.ini_options] table in {cfg!r}",
+                    )
+                sections_to_check.append(ini_opts)
+            direct_opts = {k: v for k, v in pytest_tbl.items() if k != "ini_options"}
+            if direct_opts:
+                sections_to_check.append(direct_opts)
+            for opts in sections_to_check:
+                self._validate_pytest_config_options(opts, command, cfg)
+            return
+
+        parser = configparser.RawConfigParser(allow_no_value=True)
+        try:
+            text = resolved_cfg.read_text(encoding="utf-8")
+            parser.read_string(text)
+        except (OSError, UnicodeDecodeError, configparser.Error) as exc:
+            raise ScopeViolationError(
+                self.role,
+                "shell",
+                command,
+                f"Unreadable or malformed pytest config {cfg!r}: {exc}",
+            ) from exc
+
+        for sec_name in ("pytest", "tool:pytest"):
+            if parser.has_section(sec_name):
+                self._validate_pytest_config_options(
+                    dict(parser.items(sec_name)), command, cfg
+                )
+
     def _check_pytest_override_ini(
-        self, val: str, command: str, *, in_pytest_addopts: bool = False
+        self,
+        val: str,
+        command: str,
+        *,
+        in_pytest_addopts: bool = False,
+        from_config_file: bool = False,
     ) -> None:
         if "=" in val:
             ini_key, ini_val = val.split("=", 1)
             key_lower = ini_key.strip().lower()
             if key_lower == "addopts":
-                if self.readonly:
+                if self.readonly and not from_config_file:
                     raise ScopeViolationError(
                         self.role,
                         "shell",
@@ -1441,8 +1725,20 @@ class RolePolicy:
                     )
                 self.enforce_write(ini_val.strip())
                 return
-            if "/" in ini_val or "\\" in ini_val or ".." in ini_val or Path(ini_val).is_absolute():
-                self._resolve_and_check_containment(ini_val.strip(), "read")
+            try:
+                val_segments = shlex.split(ini_val)
+            except ValueError:
+                val_segments = ini_val.split()
+            for seg in val_segments:
+                if (
+                    "/" in seg
+                    or "\\" in seg
+                    or ".." in seg
+                    or Path(seg).is_absolute()
+                    or "://" in seg
+                    or seg.lower().startswith("file:")
+                ):
+                    self._resolve_and_check_containment(seg, "read")
 
     def _extract_tool_paths(
         self,

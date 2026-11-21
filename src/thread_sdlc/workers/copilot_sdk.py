@@ -104,6 +104,12 @@ def _extract_attr_or_key(obj: Any, *names: str) -> Any:
     return None
 
 
+_SHELL_PATH_VALUE_KEYS = ("path", "file_name", "fileName", "resolved_path", "resolvedPath")
+_SHELL_PATH_OBJECT_META_KEYS = frozenset(
+    (*_SHELL_PATH_VALUE_KEYS, "content", "type")
+)
+
+
 def _extract_shell_paths(raw_paths: Any) -> list[str]:
     """Extract non-empty path strings from SDK ``possible_paths`` / ``resolved_paths``."""
     extracted: list[str] = []
@@ -114,11 +120,17 @@ def _extract_shell_paths(raw_paths: Any) -> list[str]:
             extracted.append(raw_paths.strip())
         return extracted
     if isinstance(raw_paths, dict):
-        direct = _extract_attr_or_key(
-            raw_paths, "path", "file_name", "fileName", "resolved_path", "resolvedPath"
-        )
-        if direct is not None:
-            items: list[Any] = [direct]
+        keys = set(raw_paths.keys())
+        if (
+            keys
+            and keys.issubset(_SHELL_PATH_OBJECT_META_KEYS)
+            and any(k in raw_paths for k in _SHELL_PATH_VALUE_KEYS)
+        ):
+            items: list[Any] = [
+                raw_paths[k]
+                for k in _SHELL_PATH_VALUE_KEYS
+                if k in raw_paths and raw_paths[k] is not None
+            ]
         else:
             items = []
             for k, v in raw_paths.items():
@@ -136,6 +148,8 @@ def _extract_shell_paths(raw_paths: Any) -> list[str]:
         if isinstance(item, str):
             if item.strip():
                 extracted.append(item.strip())
+        elif isinstance(item, (dict, list, tuple, set)):
+            extracted.extend(_extract_shell_paths(item))
         elif item is not None:
             p = _extract_attr_or_key(
                 item, "path", "file_name", "fileName", "resolved_path", "resolvedPath"
@@ -358,6 +372,24 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
                 for target in targets:
                     self._policy.enforce_write(target)
             elif kind in ("shell", "commands"):
+                possible_urls_raw = _extract_attr_or_key(
+                    request, "possible_urls", "possibleUrls"
+                )
+                if possible_urls_raw:
+                    first_url = (
+                        possible_urls_raw[0]
+                        if isinstance(possible_urls_raw, (list, tuple)) and possible_urls_raw
+                        else possible_urls_raw
+                    )
+                    target_url = (
+                        _extract_attr_or_key(first_url, "url", "uri") or str(first_url)
+                    )
+                    raise ScopeViolationError(
+                        self._policy.role,
+                        "shell",
+                        str(target_url),
+                        "Shell permission requests with external URLs are denied by Thread role policy (fail closed)",
+                    )
                 has_redir = bool(
                     _extract_attr_or_key(
                         request, "has_write_file_redirection", "hasWriteFileRedirection"

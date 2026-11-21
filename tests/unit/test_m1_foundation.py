@@ -2294,3 +2294,261 @@ def test_read_search_extra_path_keys_containment(tmp_path: Path) -> None:
     be.enforce_tool_call("grep_search", {"options": {"search_paths": ["app"]}})
     be.enforce_tool_call("grep_search", {"folder": "app"})
     be.enforce_tool_call("grep_search", {"root_dir": "app"})
+
+
+# ---------------------------------------------------------------------------
+# 13. Iteration 7 Regression Tests (R6 Verifier Findings 1-4)
+# ---------------------------------------------------------------------------
+
+
+def test_pytest_outer_debug_flag_blocked(tmp_path: Path) -> None:
+    """Verify outer pytest --debug / --debug=<file> / --debug <file> are blocked across roles."""
+    wt = tmp_path / "wt"
+    (wt / "tests" / "unit").mkdir(parents=True)
+    (wt / ".thread").mkdir(parents=True)
+    (wt / ".thread" / "policy.yaml").write_text("base_branch: main\n", encoding="utf-8")
+    (wt / "tests" / "unit" / "test_ok.py").write_text("def test_ok(): pass\n", encoding="utf-8")
+
+    be = RolePolicy(
+        role="backend",
+        worktree_root=wt,
+        allowed_paths=["app/**", "tests/**"],
+        denied_paths=[".thread/policy.yaml", ".thread/**"],
+        allowed_shell_prefixes=["pytest", "python"],
+    )
+    ro = RolePolicy(
+        role="reviewer_readonly",
+        worktree_root=wt,
+        allowed_paths=[],
+        denied_paths=["**"],
+        allowed_shell_prefixes=["pytest", "python"],
+        readonly=True,
+    )
+
+    for cmd in (
+        "pytest --debug=.thread/policy.yaml tests/unit/test_ok.py",
+        "pytest --debug .thread/policy.yaml tests/unit/test_ok.py",
+        "pytest tests/unit/test_ok.py --debug",
+        "pytest --debug= tests/unit/test_ok.py",
+        "python -m pytest --debug=.thread/policy.yaml tests/unit/test_ok.py",
+        "python -m coverage run -m pytest --debug=.thread/policy.yaml tests/unit/test_ok.py",
+    ):
+        with pytest.raises(ScopeViolationError):
+            be.enforce_shell(cmd)
+        with pytest.raises(ScopeViolationError):
+            ro.enforce_shell(cmd)
+
+    # Coverage's own --debug=<topic> before `-m pytest` remains allowed for writable roles
+    assert be.enforce_shell("python -m coverage run --debug=trace -m pytest tests/unit/test_ok.py")
+
+
+def test_pytest_config_file_and_bundled_c_containment(tmp_path: Path) -> None:
+    """Verify pytest -c / --config-file / bundled -vc/-qc / --rootdir smuggling is blocked while valid root configs pass."""
+    wt = tmp_path / "wt"
+    (wt / "app").mkdir(parents=True)
+    (wt / "tests" / "unit").mkdir(parents=True)
+    (wt / ".thread").mkdir(parents=True)
+    (wt / ".thread" / "policy.yaml").write_text("base_branch: main\n", encoding="utf-8")
+    (wt / "tests" / "unit" / "test_ok.py").write_text("def test_ok(): pass\n", encoding="utf-8")
+    (wt / "app" / "evil.ini").write_text(
+        "[pytest]\naddopts = --log-file=.thread/policy.yaml\n", encoding="utf-8"
+    )
+    (wt / "app" / "pytest.ini").write_text(
+        "[pytest]\naddopts = --log-file=.thread/policy.yaml\n", encoding="utf-8"
+    )
+    (wt / "tests" / "evil.ini").write_text(
+        "[pytest]\naddopts = --junitxml=.thread/policy.yaml\n", encoding="utf-8"
+    )
+
+    be = RolePolicy(
+        role="backend",
+        worktree_root=wt,
+        allowed_paths=["app/**", "tests/**"],
+        denied_paths=[".thread/policy.yaml", ".thread/**"],
+        allowed_shell_prefixes=["pytest", "python"],
+    )
+
+    # Non-regression when pyproject.toml is absent on disk (empty tmp_path)
+    assert be.enforce_shell("python -m pytest -c pyproject.toml")
+    assert be.enforce_shell("pytest -vcpyproject.toml tests/unit/test_ok.py")
+    assert be.enforce_shell("pytest -kc tests/unit/test_ok.py")
+
+    for bad_cmd in (
+        "pytest -vc/outside/evil.ini tests/unit/test_ok.py",
+        "pytest -qc ../outside/evil.ini tests/unit/test_ok.py",
+        "pytest -c /etc/evil.ini tests/unit/test_ok.py",
+        "pytest --config-file /outside/evil.ini tests/unit/test_ok.py",
+        "pytest --config-file=/outside/evil.ini tests/unit/test_ok.py",
+        "pytest -c app/evil.ini tests/unit/test_ok.py",
+        "pytest --config-file=app/evil.ini tests/unit/test_ok.py",
+        "pytest --config-file app/evil.ini tests/unit/test_ok.py",
+        "pytest -capp/evil.ini tests/unit/test_ok.py",
+        "pytest -c=app/evil.ini tests/unit/test_ok.py",
+        "pytest -qc app/evil.ini tests/unit/test_ok.py",
+        "pytest -qc=tests/evil.ini tests/unit/test_ok.py",
+        "pytest -vcapp/evil.ini tests/unit/test_ok.py",
+        "pytest --rootdir=app tests/unit/test_ok.py",
+        "pytest --rootdir app tests/unit/test_ok.py",
+        "pytest -c",
+        "pytest --config-file",
+        "pytest -qc",
+        "pytest -c=",
+        "pytest -qc=",
+        "pytest --config-file=",
+        "pytest --rootdir",
+    ):
+        with pytest.raises(ScopeViolationError):
+            be.enforce_shell(bad_cmd)
+
+    # Malicious on-disk root configs must be rejected
+    (wt / "pytest.ini").write_text(
+        "[pytest]\naddopts = --log-file=.thread/policy.yaml\n", encoding="utf-8"
+    )
+    with pytest.raises(ScopeViolationError):
+        be.enforce_shell("pytest -c pytest.ini tests/unit/test_ok.py")
+    (wt / "pytest.ini").unlink()
+
+    (wt / "pyproject.toml").write_text(
+        '[tool.pytest.ini_options]\naddopts = ["--junitxml=.thread/policy.yaml"]\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ScopeViolationError):
+        be.enforce_shell("pytest -c pyproject.toml tests/unit/test_ok.py")
+
+    (wt / "pyproject.toml").write_text(
+        '[tool.pytest.ini_options]\nlog_file = ".thread/policy.yaml"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ScopeViolationError):
+        be.enforce_shell("pytest -vcpyproject.toml tests/unit/test_ok.py")
+
+    (wt / "pyproject.toml").write_text("[broken toml ===\n", encoding="utf-8")
+    with pytest.raises(ScopeViolationError):
+        be.enforce_shell("pytest --config-file=pyproject.toml tests/unit/test_ok.py")
+
+    # Benign on-disk pyproject.toml passes across all valid -c / --config-file forms
+    (wt / "pyproject.toml").write_text(
+        '[tool.pytest.ini_options]\ntestpaths = ["tests"]\npythonpath = ["src"]\naddopts = "-v -k test_ok"\n',
+        encoding="utf-8",
+    )
+    assert be.enforce_shell("python -m pytest -c pyproject.toml tests/unit/test_ok.py")
+    assert be.enforce_shell("pytest -vcpyproject.toml tests/unit/test_ok.py")
+    assert be.enforce_shell("pytest -qc pyproject.toml tests/unit/test_ok.py")
+    assert be.enforce_shell("pytest --config-file=pyproject.toml tests/unit/test_ok.py")
+    assert be.enforce_shell("pytest -c=pyproject.toml tests/unit/test_ok.py")
+
+
+def test_pytest_override_ini_multipath_containment(tmp_path: Path) -> None:
+    """Verify space-separated multi-path values in pytest -o ini overrides enforce containment."""
+    wt = tmp_path / "wt"
+    (wt / "tests" / "unit").mkdir(parents=True)
+    (wt / "tests" / "integration").mkdir(parents=True)
+    (wt / "tests" / "unit" / "test_ok.py").write_text("def test_ok(): pass\n", encoding="utf-8")
+
+    be = RolePolicy(
+        role="backend",
+        worktree_root=wt,
+        allowed_paths=["app/**", "tests/**"],
+        denied_paths=[".thread/policy.yaml"],
+        allowed_shell_prefixes=["pytest"],
+    )
+
+    for bad_cmd in (
+        'pytest -o "testpaths=tests/unit /outside" tests/unit/test_ok.py',
+        'pytest -o "pythonpath=src ../outside" tests/unit/test_ok.py',
+        'pytest -o "norecursedirs=build /etc" tests/unit/test_ok.py',
+        'pytest -o \'testpaths="tests/unit" "/outside"\' tests/unit/test_ok.py',
+        'pytest -o "testpaths=tests/unit https://evil.example.com" tests/unit/test_ok.py',
+    ):
+        with pytest.raises(ScopeViolationError):
+            be.enforce_shell(bad_cmd)
+
+    assert be.enforce_shell('pytest -o "testpaths=tests/unit tests/integration" tests/unit/test_ok.py')
+
+
+def test_sdk_shell_resolved_paths_dict_key_shadowing_and_possible_urls(tmp_path: Path) -> None:
+    """Verify SDK _extract_shell_paths handles 'path' key shadowing and PermissionRequestShell.possible_urls fails closed."""
+    from copilot.generated.session_events import (
+        PermissionRequestShell,
+        PermissionRequestShellPossibleUrl,
+    )
+
+    wt = tmp_path / "wt"
+    (wt / "app").mkdir(parents=True)
+    (wt / "app" / "main.py").write_text("x = 1\n", encoding="utf-8")
+    (wt / "tests" / "unit").mkdir(parents=True)
+
+    be = RolePolicy(
+        role="backend",
+        worktree_root=wt,
+        allowed_paths=["app/**", "tests/**"],
+        denied_paths=[".thread/policy.yaml"],
+        allowed_shell_prefixes=["pytest"],
+    )
+    sdk_be = CopilotSdkAdapter(be)
+
+    deny_reqs: list[Any] = [
+        PermissionRequestShell(
+            can_offer_session_approval=False,
+            commands=[],
+            full_command_text="pytest tests/unit",
+            has_write_file_redirection=False,
+            intention="run tests",
+            possible_paths=[],
+            possible_urls=[],
+            resolved_paths={"path": "app/main.py", "evil": "/etc/passwd"},
+        ),
+        PermissionRequestShell(
+            can_offer_session_approval=False,
+            commands=[],
+            full_command_text="pytest tests/unit",
+            has_write_file_redirection=False,
+            intention="run tests",
+            possible_paths=[],
+            possible_urls=[],
+            resolved_paths={"path": "app/main.py", "resolvedPath": "/etc/passwd"},
+        ),
+        PermissionRequestShell(
+            can_offer_session_approval=False,
+            commands=[],
+            full_command_text="pytest tests/unit",
+            has_write_file_redirection=False,
+            intention="run tests",
+            possible_paths=[],
+            possible_urls=[PermissionRequestShellPossibleUrl(url="https://evil.example.com")],
+        ),
+        {
+            "kind": "shell",
+            "fullCommandText": "pytest tests/unit",
+            "possiblePaths": [],
+            "possibleUrls": [{"url": "https://evil.example.com"}],
+        },
+    ]
+    for req in deny_reqs:
+        dec = asyncio.run(sdk_be._on_permission_request(req))
+        dec_kind = dec["kind"] if isinstance(dec, dict) else getattr(dec, "kind", None)
+        assert dec_kind == "denied-by-rules", f"Expected denied-by-rules for {req!r}, got {dec!r}"
+
+    ok_reqs: list[Any] = [
+        PermissionRequestShell(
+            can_offer_session_approval=False,
+            commands=[],
+            full_command_text="pytest tests/unit",
+            has_write_file_redirection=False,
+            intention="run tests",
+            possible_paths=[],
+            possible_urls=[],
+            resolved_paths={"path": "app/main.py", "tests": str(wt / "tests" / "unit")},
+        ),
+        {
+            "kind": "shell",
+            "full_command_text": "pytest tests/unit",
+            "possible_paths": [{"path": "app/main.py", "content": "ok"}],
+            "possible_urls": [],
+        },
+    ]
+    for req in ok_reqs:
+        dec = asyncio.run(sdk_be._on_permission_request(req))
+        dec_kind = dec["kind"] if isinstance(dec, dict) else getattr(dec, "kind", None)
+        expected_kind = "approved" if isinstance(req, dict) else "approve-once"
+        assert dec_kind == expected_kind, f"Expected {expected_kind} for {req!r}, got {dec!r}"
