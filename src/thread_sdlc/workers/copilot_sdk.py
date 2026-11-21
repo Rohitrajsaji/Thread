@@ -110,7 +110,9 @@ _SHELL_PATH_OBJECT_META_KEYS = frozenset(
 )
 
 
-def _extract_shell_paths(raw_paths: Any) -> list[str]:
+def _extract_shell_paths(
+    raw_paths: Any, *, allow_single_object: bool = True
+) -> list[str]:
     """Extract non-empty path strings from SDK ``possible_paths`` / ``resolved_paths``."""
     extracted: list[str] = []
     if raw_paths is None:
@@ -122,7 +124,8 @@ def _extract_shell_paths(raw_paths: Any) -> list[str]:
     if isinstance(raw_paths, dict):
         keys = set(raw_paths.keys())
         if (
-            keys
+            allow_single_object
+            and keys
             and keys.issubset(_SHELL_PATH_OBJECT_META_KEYS)
             and any(k in raw_paths for k in _SHELL_PATH_VALUE_KEYS)
         ):
@@ -149,7 +152,9 @@ def _extract_shell_paths(raw_paths: Any) -> list[str]:
             if item.strip():
                 extracted.append(item.strip())
         elif isinstance(item, (dict, list, tuple, set)):
-            extracted.extend(_extract_shell_paths(item))
+            extracted.extend(
+                _extract_shell_paths(item, allow_single_object=allow_single_object)
+            )
         elif item is not None:
             p = _extract_attr_or_key(
                 item, "path", "file_name", "fileName", "resolved_path", "resolvedPath"
@@ -402,7 +407,7 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
                     request, "resolved_paths", "resolvedPaths"
                 )
                 shell_paths = _extract_shell_paths(possible_paths_raw) + _extract_shell_paths(
-                    resolved_paths_raw
+                    resolved_paths_raw, allow_single_object=False
                 )
                 if has_redir:
                     if self._policy.readonly:
