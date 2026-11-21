@@ -167,9 +167,14 @@ _PATH_ARG_KEYS = (
     "directory",
     "dir",
     "uri",
+    "url",
 )
 
-_PATH_LIST_KEYS = frozenset({"paths", "files", "file_paths", "filePaths", "targets"})
+_PATH_LIST_KEYS = frozenset(
+    {"paths", "files", "file_paths", "filePaths", "targets", "roots", "directories", "dirs"}
+)
+
+_PYTEST_VALUE_SHORT_FLAGS = frozenset({"k", "m", "c", "r", "W", "n", "p"})
 
 _READ_EXTRA_PATH_KEYS = frozenset(
     {
@@ -294,6 +299,56 @@ def glob_match(rel_posix: str, pattern: str) -> bool:
         return False
     path_parts = tuple(p for p in PurePosixPath(clean_path).parts if p not in ("", "."))
     return _match_parts(path_parts, pat_parts)
+
+
+def _pattern_can_match_under_dir(dir_parts: tuple[str, ...], pat_parts: list[str]) -> bool:
+    """Return True if ``pat_parts`` can match any descendant ``dir_parts + suffix`` (len(suffix) >= 1)."""
+    if not dir_parts or not pat_parts:
+        return False
+    memo: dict[tuple[int, int], bool] = {}
+
+    def _dp(i: int, j: int) -> bool:
+        key = (i, j)
+        if key in memo:
+            return memo[key]
+        if i == len(dir_parts):
+            res = j < len(pat_parts)
+        elif j == len(pat_parts):
+            res = False
+        elif pat_parts[j] == "**":
+            res = _dp(i, j + 1) or _dp(i + 1, j)
+        elif fnmatch.fnmatchcase(dir_parts[i], pat_parts[j]):
+            res = _dp(i + 1, j + 1)
+        else:
+            res = False
+        memo[key] = res
+        return res
+
+    return _dp(0, 0)
+
+
+def _parse_bundled_pytest_o(tok: str) -> tuple[bool, str | None, bool]:
+    """Inspect a short pytest option cluster like ``-qo`` or ``-qolog_file=...``.
+
+    Returns ``(found_o, attached_val_or_none, has_empty_equals)``.
+    Stops scanning at value-taking short options (``k, m, c, r, W, n, p``) so
+    expressions like ``-kfoo`` or ``-mnot_slow`` are never mistaken for ``-o``.
+    """
+    if not tok.startswith("-") or tok.startswith("--") or len(tok) <= 2:
+        return False, None, False
+    chars = tok[1:]
+    for j, ch in enumerate(chars):
+        if ch in _PYTEST_VALUE_SHORT_FLAGS:
+            return False, None, False
+        if ch == "o":
+            rest = chars[j + 1 :]
+            if not rest:
+                return True, None, False
+            if rest.startswith("="):
+                val = rest[1:]
+                return True, val, (val == "")
+            return True, rest, False
+    return False, None, False
 
 
 def _has_unquoted_shell_metachar(command: str) -> str | None:
@@ -466,6 +521,10 @@ class RolePolicy:
             if not raw:
                 raise ScopeViolationError(
                     self.role, operation, orig_raw, "Empty file URI path"
+                )
+            if "\x00" in raw:
+                raise ScopeViolationError(
+                    self.role, operation, orig_raw, "Null byte in target path"
                 )
 
         p = Path(raw)
@@ -873,15 +932,25 @@ class RolePolicy:
             elif cov_nested_module == "ruff" and cov_nested_end_idx is not None:
                 ruff_tokens = tokens[cov_nested_end_idx + 1 :]
 
-        ruff_subcmd = next((t for t in ruff_tokens if not t.startswith("-")), None) if is_ruff else None
+        ruff_subcmd: str | None = None
         has_ruff_fix_flag = False
         if is_ruff:
+            skip_ruff_val = False
             for rt in ruff_tokens:
+                if skip_ruff_val:
+                    skip_ruff_val = False
+                    continue
                 if rt == "--":
                     break
-                if rt in ("--fix", "--fix-only", "--unsafe-fixes"):
-                    has_ruff_fix_flag = True
-                    break
+                if rt in _RUFF_VALUE_FLAGS:
+                    skip_ruff_val = True
+                    continue
+                if rt.startswith("-"):
+                    if rt in ("--fix", "--fix-only", "--unsafe-fixes", "--add-noqa"):
+                        has_ruff_fix_flag = True
+                    continue
+                if ruff_subcmd is None:
+                    ruff_subcmd = rt
         is_ruff_mutating = is_ruff and (ruff_subcmd == "format" or has_ruff_fix_flag)
 
         if exe_lower in ("node", "nodejs"):
@@ -938,7 +1007,14 @@ class RolePolicy:
                     or t.startswith("--ext-diff=")
                     or t == "-o"
                     or (t.startswith("-o") and not t.startswith("--"))
-                    or (is_pytest and (t == "--override-ini" or t.startswith("--override-ini=")))
+                    or (
+                        is_pytest
+                        and (
+                            t == "--override-ini"
+                            or t.startswith("--override-ini=")
+                            or _parse_bundled_pytest_o(t)[0]
+                        )
+                    )
                     or (
                         is_coverage
                         and (
@@ -1037,6 +1113,36 @@ class RolePolicy:
                 continue
 
             if tok.startswith("-"):
+                # Bundled / glued pytest `-o` clusters (`-qo`, `-vo`, `-qolog_file=...`, `-qo=...`)
+                # must be checked BEFORE `if "=" in tok:` and before falling through to `tok[2:]`.
+                if (
+                    is_pytest
+                    and not in_cov_prefix
+                    and not tok.startswith("--")
+                    and len(tok) > 2
+                ):
+                    found_o, attached_o, empty_eq = _parse_bundled_pytest_o(tok)
+                    if found_o:
+                        if self.readonly:
+                            raise ScopeViolationError(
+                                self.role,
+                                "shell",
+                                command,
+                                "Read-only role cannot override pytest ini via '-o'",
+                            )
+                        if empty_eq:
+                            raise ScopeViolationError(
+                                self.role,
+                                "shell",
+                                command,
+                                "Missing value for pytest '-o' flag",
+                            )
+                        if attached_o is None:
+                            expect_pytest_ini = True
+                        else:
+                            self._check_pytest_override_ini(attached_o, command)
+                        continue
+
                 # Glued short flags (`-o<val>`, `-d<val>`) must be checked BEFORE `if "=" in tok:`
                 # so `-olog_file=.thread/policy.yaml` is never treated as `--flag=val`.
                 if (
@@ -1185,10 +1291,20 @@ class RolePolicy:
                 rel_norm = (
                     resolved_target.relative_to(self.worktree_root).as_posix().rstrip("/")
                 )
+                is_dir_target = (
+                    resolved_target.is_dir()
+                    or r_target.endswith(("/", "\\"))
+                    or rel_norm == "."
+                    or (not resolved_target.exists() and not PurePosixPath(rel_norm).suffix)
+                )
+                rel_parts = tuple(p for p in PurePosixPath(rel_norm).parts if p not in ("", "."))
                 for pat in (*self.denied_paths, *self.deny_gate_files):
-                    pat_norm = "/".join(_normalize_pattern(pat))
+                    pat_parts = _normalize_pattern(pat)
+                    pat_norm = "/".join(pat_parts)
                     if pat_norm and (
-                        pat_norm == rel_norm or pat_norm.startswith(f"{rel_norm}/")
+                        pat_norm == rel_norm
+                        or pat_norm.startswith(f"{rel_norm}/")
+                        or (is_dir_target and _pattern_can_match_under_dir(rel_parts, pat_parts))
                     ):
                         raise ScopeViolationError(
                             self.role,
@@ -1356,9 +1472,14 @@ class RolePolicy:
                 f"Read-only role cannot invoke unrecognized or mutating tool {tool_name!r}",
             )
 
-        # Unrecognized tools carrying path args must be write-checked (fail closed)
+        # Unrecognized tools carrying path args must be write-checked (fail closed),
+        # while read/search directory keys must still satisfy worktree read containment.
         for target in self._extract_tool_paths(args):
             self.enforce_write(target)
+        for target in self._extract_tool_paths(
+            args, include_patches=False, extra_keys=_READ_EXTRA_PATH_KEYS
+        ):
+            self.enforce_read(target)
 
 
 def _run_pre_tool_use_hook() -> int:

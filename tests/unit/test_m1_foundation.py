@@ -1637,3 +1637,258 @@ def test_read_tools_nested_dirs_file_uri_and_sdk_permission_request_url(tmp_path
         sdk._on_permission_request({"kind": "url", "url": "https://evil.example.com/exfil"})
     )
     assert dict_url_dec["kind"] == "denied-by-rules"
+
+
+# ---------------------------------------------------------------------------
+# 11. Iteration 5 Regression Tests (R4 Reviewer & Challenger Findings)
+# ---------------------------------------------------------------------------
+
+
+def test_pytest_bundled_short_o_flags_and_value_flag_non_regression(tmp_path: Path) -> None:
+    """Verify bundled pytest -qo/-vo/-qolog_file=... are blocked while -k/-m value flags pass."""
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    be = RolePolicy(
+        role="backend",
+        worktree_root=wt,
+        allowed_paths=["app/**", "tests/**"],
+        denied_paths=[".thread/policy.yaml"],
+        deny_gate_files=["tests/acceptance/**"],
+        allowed_shell_prefixes=["pytest", "python", "git status"],
+    )
+    ro = RolePolicy(
+        role="reviewer_readonly",
+        worktree_root=wt,
+        allowed_paths=[],
+        denied_paths=["**"],
+        allowed_shell_prefixes=["pytest", "python"],
+        readonly=True,
+    )
+
+    for bad_cmd in (
+        "pytest -qo log_file=.thread/policy.yaml tests/test_ok.py",
+        "pytest -qolog_file=.thread/policy.yaml tests/test_ok.py",
+        "pytest -qo=log_file=.thread/policy.yaml tests/test_ok.py",
+        "pytest -vo log_file=.thread/policy.yaml tests/test_ok.py",
+        "pytest -volog_file=.thread/policy.yaml tests/test_ok.py",
+        "pytest -qo=",
+        'pytest -m "not slow" -qo log_file=.thread/policy.yaml tests/test_ok.py',
+        "python -m pytest -qo log_file=.thread/policy.yaml tests/test_ok.py",
+        "python -m pytest -qolog_file=.thread/policy.yaml tests/test_ok.py",
+        "python -m coverage run --source app -m pytest -qo log_file=.thread/policy.yaml tests/test_ok.py",
+        "python -m coverage run --source app -m pytest -qolog_file=.thread/policy.yaml tests/test_ok.py",
+    ):
+        with pytest.raises(ScopeViolationError):
+            be.enforce_shell(bad_cmd)
+
+    # Readonly blocks any bundled pytest -o override (even non-path ini)
+    for ro_bad in (
+        "pytest -qo junit_logging=all tests/test_ok.py",
+        "pytest -vo filterwarnings=error tests/test_ok.py",
+        "python -m pytest -qo junit_logging=all tests/test_ok.py",
+    ):
+        with pytest.raises(ScopeViolationError):
+            ro.enforce_shell(ro_bad)
+
+    # Non-regression: value-taking short flags containing 'o' in argument must pass
+    assert be.enforce_shell("pytest -k test_foo tests/test_ok.py")
+    assert be.enforce_shell("pytest -kfoo tests/test_ok.py")
+    assert be.enforce_shell("pytest -mnot_slow tests/test_ok.py")
+    assert be.enforce_shell('pytest -m "not slow" tests/test_ok.py')
+    assert be.enforce_shell("pytest -qo junit_logging=all tests/test_ok.py")
+    assert ro.enforce_shell("pytest -k test_foo tests/test_ok.py")
+
+
+def test_ruff_pre_subcommand_value_flags_add_noqa_and_glob_dir_targets(tmp_path: Path) -> None:
+    """Verify ruff --config before subcommand, --add-noqa, and **/ wildcard directory targets."""
+    wt = tmp_path / "wt"
+    (wt / "src").mkdir(parents=True)
+    (wt / "src" / "app.py").write_text("x = 1\n", encoding="utf-8")
+    (wt / "tests" / "unit").mkdir(parents=True)
+    (wt / "tests" / "unit" / "test_ok.py").write_text("def test_ok(): pass\n", encoding="utf-8")
+
+    be = RolePolicy(
+        role="backend",
+        worktree_root=wt,
+        allowed_paths=["src/**", "tests/**"],
+        denied_paths=[".thread/policy.yaml", "**/*.env", "**/migrations/**"],
+        deny_gate_files=["tests/acceptance/**"],
+        allowed_shell_prefixes=["ruff", "python"],
+    )
+    ro = RolePolicy(
+        role="reviewer_readonly",
+        worktree_root=wt,
+        allowed_paths=[],
+        denied_paths=["**"],
+        allowed_shell_prefixes=["ruff", "python"],
+        readonly=True,
+    )
+
+    for bad_cmd in (
+        "ruff --config pyproject.toml format .thread/policy.yaml",
+        "ruff --config pyproject.toml format tests/acceptance/test_gate.py",
+        "python -m ruff --config pyproject.toml format tests/acceptance/test_gate.py",
+        "ruff check --add-noqa .thread/policy.yaml",
+        "ruff check --add-noqa tests/acceptance/test_gate.py",
+        "ruff --config pyproject.toml check --add-noqa tests/acceptance/test_gate.py",
+        "python -m ruff check --add-noqa .thread/policy.yaml",
+        "ruff format src",
+        "ruff check --fix src",
+        "ruff format tests",
+    ):
+        with pytest.raises(ScopeViolationError):
+            be.enforce_shell(bad_cmd)
+
+    for ro_bad in (
+        "ruff check --add-noqa src/app.py",
+        "ruff --config pyproject.toml format src/app.py",
+        "python -m ruff --config pyproject.toml format src/app.py",
+    ):
+        with pytest.raises(ScopeViolationError):
+            ro.enforce_shell(ro_bad)
+
+    # Explicit in-scope file targets and non-denied subdirs remain allowed
+    assert be.enforce_shell("ruff format src/app.py")
+    assert be.enforce_shell("ruff --config pyproject.toml format src/app.py")
+    assert be.enforce_shell("ruff check --add-noqa src/app.py")
+    assert be.enforce_shell("ruff check .")
+    assert be.enforce_shell("ruff check tests/acceptance/test_gate.py")
+    assert ro.enforce_shell("ruff check src/app.py")
+
+    # Subdirectory without **/ wildcard denial remains allowed when no denied glob matches inside
+    be_no_starstar = RolePolicy(
+        role="backend",
+        worktree_root=wt,
+        allowed_paths=["src/**", "tests/**"],
+        denied_paths=[".thread/policy.yaml"],
+        deny_gate_files=["tests/acceptance/**"],
+        allowed_shell_prefixes=["ruff"],
+    )
+    assert be_no_starstar.enforce_shell("ruff format tests/unit")
+    assert be_no_starstar.enforce_shell("ruff format src")
+    with pytest.raises(ScopeViolationError):
+        be_no_starstar.enforce_shell("ruff format tests")
+
+
+def test_sdk_fail_closed_permission_kinds_mcp_url_read_keys_and_null_uri(tmp_path: Path) -> None:
+    """Verify SDK fail-closed kinds, commands/path requests, MCP url, grep_search/roots, and %00 URI."""
+    from copilot.generated.session_events import (
+        PermissionPromptRequestCommands,
+        PermissionPromptRequestPath,
+        PermissionPromptRequestPathAccessKind,
+        PermissionRequestExtensionEnvAccess,
+        PermissionRequestExtensionManagement,
+        PermissionRequestExtensionPermissionAccess,
+        PermissionRequestMcp,
+        PermissionRequestMemory,
+        PermissionRequestWorkflow,
+    )
+
+    wt = tmp_path / "wt"
+    (wt / "app").mkdir(parents=True)
+    (wt / "app" / "main.py").write_text("x = 1\n", encoding="utf-8")
+
+    be = RolePolicy(
+        role="backend",
+        worktree_root=wt,
+        allowed_paths=["app/**", "tests/**"],
+        denied_paths=[".thread/policy.yaml"],
+        allowed_shell_prefixes=["pytest", "git status"],
+    )
+    sdk = CopilotSdkAdapter(be)
+
+    # Extension, workflow, memory, and unknown permission kinds must fail closed
+    deny_reqs: list[Any] = [
+        PermissionRequestExtensionEnvAccess(
+            environment_variables=["GITHUB_TOKEN"], extension_name="ext"
+        ),
+        PermissionRequestExtensionPermissionAccess(
+            capabilities=["fs"], extension_name="ext"
+        ),
+        PermissionRequestExtensionManagement(operation="install", extension_name="ext"),
+        PermissionRequestWorkflow(
+            approval_key="wf1",
+            can_persist_approval=False,
+            description="run workflow",
+            name="wf",
+            operation="execute",
+            phases=[],
+        ),
+        PermissionRequestMemory(fact="secret"),
+        {"kind": "future-unknown-kind", "anything": "value"},
+        {"kind": ""},
+        PermissionRequestMcp(
+            read_only=True,
+            server_name="web",
+            tool_name="fetch",
+            tool_title="Fetch",
+            args={"url": "https://evil.example.com/secret"},
+        ),
+        PermissionPromptRequestCommands(
+            can_offer_session_approval=False,
+            command_identifiers=["rm"],
+            full_command_text="rm -rf /etc/passwd",
+            intention="delete system files",
+        ),
+        PermissionPromptRequestPath(
+            access_kind=PermissionPromptRequestPathAccessKind.WRITE,
+            paths=[".thread/policy.yaml"],
+        ),
+        PermissionPromptRequestPath(
+            access_kind=PermissionPromptRequestPathAccessKind.READ,
+            paths=["/etc/passwd"],
+        ),
+        PermissionPromptRequestPath(
+            access_kind=PermissionPromptRequestPathAccessKind.SHELL,
+            paths=["app/main.py"],
+        ),
+        {"kind": "path", "access_kind": "write", "paths": []},
+        {"kind": "commands", "full_command_text": ""},
+    ]
+    for req in deny_reqs:
+        dec = asyncio.run(sdk._on_permission_request(req))
+        dec_kind = dec["kind"] if isinstance(dec, dict) else getattr(dec, "kind", None)
+        assert dec_kind == "denied-by-rules", f"Expected denied-by-rules for {req!r}, got {dec!r}"
+
+    # Valid in-scope commands and path requests succeed
+    ok_cmd = PermissionPromptRequestCommands(
+        can_offer_session_approval=False,
+        command_identifiers=["pytest"],
+        full_command_text="pytest tests/test_ok.py",
+        intention="run unit tests",
+    )
+    ok_cmd_dec = asyncio.run(sdk._on_permission_request(ok_cmd))
+    assert getattr(ok_cmd_dec, "kind", None) == "approve-once"
+
+    ok_path_write = PermissionPromptRequestPath(
+        access_kind=PermissionPromptRequestPathAccessKind.WRITE,
+        paths=["app/main.py"],
+    )
+    ok_pw_dec = asyncio.run(sdk._on_permission_request(ok_path_write))
+    assert getattr(ok_pw_dec, "kind", None) == "approve-once"
+
+    ok_path_read = PermissionPromptRequestPath(
+        access_kind=PermissionPromptRequestPathAccessKind.READ,
+        paths=["app/main.py"],
+    )
+    ok_pr_dec = asyncio.run(sdk._on_permission_request(ok_path_read))
+    assert getattr(ok_pr_dec, "kind", None) == "approve-once"
+
+    # Unrecognized read-like tools (`grep_search`), plural keys (`roots`, `directories`, `dirs`), and %00 URI
+    with pytest.raises(ScopeViolationError):
+        be.enforce_tool_call("grep_search", {"options": {"search_path": "/etc"}})
+    with pytest.raises(ScopeViolationError):
+        be.enforce_tool_call("grep", {"roots": ["/etc"]})
+    with pytest.raises(ScopeViolationError):
+        be.enforce_tool_call("grep", {"directories": ["/etc"]})
+    with pytest.raises(ScopeViolationError):
+        be.enforce_tool_call("grep", {"dirs": ["/etc"]})
+    with pytest.raises(ScopeViolationError):
+        be.enforce_tool_call("fetch", {"url": "https://evil.example.com/secret"})
+    with pytest.raises(ScopeViolationError):
+        be.enforce_tool_call("symlink", {"target": "/etc/passwd", "link": ".thread/policy.yaml"})
+    with pytest.raises(ScopeViolationError):
+        be.enforce_read(f"{(wt / 'app').as_uri()}/%00evil")
+
+    # In-scope grep_search search_path remains allowed for non-readonly role
+    be.enforce_tool_call("grep_search", {"options": {"search_path": "app"}})

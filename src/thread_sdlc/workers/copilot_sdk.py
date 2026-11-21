@@ -210,7 +210,8 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
     async def _on_permission_request(
         self, request: Any, invocation: Any = None
     ) -> Any:
-        kind = str(_extract_attr_or_key(request, "kind") or "").lower()
+        raw_kind = _extract_attr_or_key(request, "kind")
+        kind = str(getattr(raw_kind, "value", raw_kind) or "").strip().lower()
         try:
             if kind == "write":
                 targets: list[str] = []
@@ -233,7 +234,30 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
                     )
                 for target in targets:
                     self._policy.enforce_write(target)
-            elif kind == "shell":
+            elif kind in ("shell", "commands"):
+                if _extract_attr_or_key(request, "request_sandbox_bypass", "requestSandboxBypass"):
+                    raise ScopeViolationError(
+                        self._policy.role,
+                        "shell",
+                        "<sandbox-bypass>",
+                        "Sandbox bypass requests are denied by Thread role policy (fail closed)",
+                    )
+                sandbox_grant = _extract_attr_or_key(
+                    request, "sandbox_path_grant", "sandboxPathGrant"
+                )
+                if sandbox_grant is not None:
+                    grant_path = _extract_attr_or_key(sandbox_grant, "path")
+                    grant_access_raw = _extract_attr_or_key(sandbox_grant, "access")
+                    grant_access = (
+                        str(getattr(grant_access_raw, "value", grant_access_raw) or "")
+                        .strip()
+                        .lower()
+                    )
+                    if isinstance(grant_path, str) and grant_path.strip():
+                        if grant_access == "read":
+                            self._policy.enforce_read(grant_path.strip())
+                        else:
+                            self._policy.enforce_write(grant_path.strip())
                 cwd = _extract_attr_or_key(
                     request, "resolved_working_directory", "resolvedWorkingDirectory", "cwd"
                 )
@@ -247,7 +271,7 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
                         self._policy.role,
                         "shell",
                         "<unknown>",
-                        "Shell permission request missing command text (fail closed)",
+                        f"{kind!r} permission request missing command text (fail closed)",
                     )
                 self._policy.enforce_shell(cmd)
             elif kind == "read":
@@ -260,6 +284,64 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
                         "Read permission request missing target path (fail closed)",
                     )
                 self._policy.enforce_read(target.strip())
+            elif kind == "path":
+                access_raw = _extract_attr_or_key(request, "access_kind", "accessKind")
+                access_kind = str(getattr(access_raw, "value", access_raw) or "").strip().lower()
+                ro_dirs = _extract_attr_or_key(
+                    request, "read_only_directories", "readOnlyDirectories"
+                )
+                if isinstance(ro_dirs, (list, tuple)):
+                    for ro_dir in ro_dirs:
+                        if isinstance(ro_dir, str) and ro_dir.strip():
+                            self._policy.enforce_read(ro_dir.strip())
+                paths_raw = _extract_attr_or_key(request, "paths", "path")
+                path_list: list[str]
+                if isinstance(paths_raw, str):
+                    path_list = [paths_raw.strip()] if paths_raw.strip() else []
+                elif isinstance(paths_raw, (list, tuple)):
+                    path_list = [
+                        p.strip() for p in paths_raw if isinstance(p, str) and p.strip()
+                    ]
+                    if len(path_list) != len(paths_raw):
+                        raise ScopeViolationError(
+                            self._policy.role,
+                            "tool",
+                            "<invalid>",
+                            "Path permission request contains invalid path entries (fail closed)",
+                        )
+                else:
+                    path_list = []
+                if not path_list:
+                    raise ScopeViolationError(
+                        self._policy.role,
+                        "tool",
+                        "<unknown>",
+                        "Path permission request missing target paths (fail closed)",
+                    )
+                if access_kind in ("write", "create", "delete", "modify"):
+                    for target in path_list:
+                        self._policy.enforce_write(target)
+                elif access_kind == "read":
+                    for target in path_list:
+                        self._policy.enforce_read(target)
+                else:
+                    raise ScopeViolationError(
+                        self._policy.role,
+                        "tool",
+                        ", ".join(path_list),
+                        f"Unsupported path permission access_kind {access_kind!r} (fail closed)",
+                    )
+            elif kind in ("mcp", "custom-tool", "hook"):
+                tool_name = _extract_attr_or_key(request, "tool_name", "toolName")
+                if not isinstance(tool_name, str) or not tool_name.strip():
+                    raise ScopeViolationError(
+                        self._policy.role,
+                        "tool",
+                        kind,
+                        f"SDK permission request {kind!r} missing tool_name (fail closed)",
+                    )
+                args = _extract_attr_or_key(request, "args", "arguments", "toolArgs", "tool_args")
+                self._policy.enforce_tool_call(tool_name.strip(), args)
             elif kind == "url":
                 url = _extract_attr_or_key(request, "url", "uri") or "<unknown>"
                 raise ScopeViolationError(
@@ -269,11 +351,12 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
                     "External URL permission requests are denied by Thread role policy (fail closed)",
                 )
             else:
-                tool_name = str(
-                    _extract_attr_or_key(request, "tool_name", "toolName", "kind") or "unknown"
+                raise ScopeViolationError(
+                    self._policy.role,
+                    "tool",
+                    kind or "<unknown>",
+                    f"SDK permission request kind {kind!r} is denied by Thread role policy (fail closed)",
                 )
-                args = _extract_attr_or_key(request, "args", "arguments", "toolArgs", "tool_args")
-                self._policy.enforce_tool_call(tool_name, args)
         except ScopeViolationError as err:
             self._scope_violation = err
             self._enqueue_event(
