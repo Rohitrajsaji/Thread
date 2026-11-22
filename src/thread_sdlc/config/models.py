@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class CommandsConfig(BaseModel):
@@ -13,6 +13,17 @@ class CommandsConfig(BaseModel):
     test: str | None = None
     lint: str | None = None
     build: str | None = None
+
+
+class ExpansionFeatures(BaseModel):
+    """Independent opt-ins for Milestone 3 capabilities."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    m3a: bool = False
+    m3b: bool = False
+    m3c: bool = False
+    m3d: bool = False
 
 
 class ThreadConfig(BaseModel):
@@ -24,10 +35,11 @@ class ThreadConfig(BaseModel):
     ui_port: int = Field(default=4242, ge=0, le=65535)
     commands: CommandsConfig = Field(default_factory=CommandsConfig)
     enabled_milestones: list[str] = Field(default_factory=lambda: ["M0", "M1"])
+    features: ExpansionFeatures = Field(default_factory=ExpansionFeatures)
 
     def is_m3_enabled(self) -> bool:
         """Return True when any M3 milestone flag is enabled."""
-        return any(m.strip().upper().startswith("M3") for m in self.enabled_milestones)
+        return any(self.features.model_dump().values())
 
 
 class TrackPolicy(BaseModel):
@@ -63,6 +75,7 @@ class CapsConfig(BaseModel):
     max_retries_per_ticket: int = Field(default=3, ge=0)
     max_turns_per_assignment: int = Field(default=30, ge=1)
     max_credits_per_thread: float = Field(default=500.0, gt=0)
+    max_goldfish_reviews: int = Field(default=3, ge=0)
 
 
 def default_protected_paths() -> list[str]:

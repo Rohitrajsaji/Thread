@@ -5,7 +5,7 @@ export interface Note {id:string; checkpoint_id:string; target_type:string; file
 export interface RuleEvidence {rule_id:string; test_nodeid:string|null; outcome:string; provenance:string}
 export interface Verification {id:string; passed:boolean; commit_sha:string; rule_evidence:RuleEvidence[]; scorecard:Record<string,{passed:boolean; issues:string[]}>}
 export interface Proposal {base_sha:string; head_sha:string; target_branch:string; diff:string}
-export interface Snapshot {thread:Thread; tickets:Ticket[]; checkpoints:Checkpoint[]; annotations:Note[]; events:{id:number; type:string; created_at:string; payload_json:string}[]; verification_runs:Verification[]}
+export interface Snapshot {thread:Thread; tickets:Ticket[]; checkpoints:Checkpoint[]; annotations:Note[]; events:{id:number; type:string; created_at:string; payload_json:string}[]; verification_runs:Verification[]; integration?: object | null}
 export class HttpError extends Error {constructor(public status:number, message:string){super(message)}}
 export async function api<T>(path:string,body?:object):Promise<T>{
   const response=await fetch('/api/'+path,{method:body?'POST':'GET',credentials:'same-origin',cache:'no-store',headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined})

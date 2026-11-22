@@ -159,14 +159,15 @@ class CopilotCliSubprocessAdapter(BaseWorkerAdapter):
             str(config_dir),
             "--output-format",
             "json",
-            "--autopilot",
-            "--max-autopilot-continues",
-            str(assignment.max_turns),
             "--deny-tool",
             "shell(git merge)",
             "--deny-tool",
             "shell(git push)",
         ]
+        if assignment.metadata.get("purpose") == "goldfish":
+            argv.extend(["--no-custom-instructions", "--disable-builtin-mcps", "--disable-mcp-server", "computer-use"])
+        else:
+            argv.extend(["--autopilot", "--max-autopilot-continues", str(assignment.max_turns)])
         if self._policy.readonly:
             for tool in sorted(_WRITE_TOOLS):
                 argv.extend(["--deny-tool", tool])

@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import re
 import subprocess
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from pydantic import BaseModel, Field
 
@@ -90,13 +93,28 @@ class WorktreeManager:
         kid = _validate_id(ticket_id, "ticket_id")
         return (self.worktrees_root / kid).resolve()
 
+    @contextmanager
+    def detached_checkout(self, revision: str) -> Iterator[Path]:
+        """Check out a pinned revision in a disposable external Git worktree."""
+        with TemporaryDirectory(prefix="thread-checkout-", dir="/tmp") as directory:
+            path = Path(directory).resolve() / "worktree"
+            _run_git(
+                ["-c", "core.hooksPath=/dev/null", "worktree", "add", "--quiet", "--detach",
+                 str(path), revision],
+                self.repo_root,
+            )
+            try:
+                yield path
+            finally:
+                _run_git(["worktree", "remove", "--force", str(path)], self.repo_root)
+
     @staticmethod
     def commit_trailer(assignment_id: str) -> str:
         aid = _validate_id(assignment_id, "assignment_id")
         return f"Thread-Assignment-Id: {aid}"
 
     def ensure_worktree(
-        self, thread_id: str, ticket_id: str, base_ref: str = "HEAD"
+        self, thread_id: str, ticket_id: str, base_ref: str = "HEAD", *, require_base: bool = False,
     ) -> WorktreeInfo:
         """Create or safely reuse a ticket worktree without clobbering uncommitted/committed state."""
         _validate_id(thread_id, "thread_id")
@@ -123,7 +141,7 @@ class WorktreeManager:
                 ["branch", "--show-current"], wt_path, check=False
             )
             if inside.returncode == 0 and cur_branch.stdout.strip() == branch:
-                wt_head = _run_git(["rev-parse", "HEAD"], wt_path).stdout.strip()
+                wt_head = self._worktree_head(wt_path, base_sha, require_base)
                 return WorktreeInfo(
                     thread_id=thread_id,
                     ticket_id=ticket_id,
@@ -154,7 +172,7 @@ class WorktreeManager:
                 self.repo_root,
             )
 
-        wt_head = _run_git(["rev-parse", "HEAD"], wt_path).stdout.strip()
+        wt_head = self._worktree_head(wt_path, base_sha, require_base)
         return WorktreeInfo(
             thread_id=thread_id,
             ticket_id=ticket_id,
@@ -163,6 +181,16 @@ class WorktreeManager:
             base_sha=base_sha,
             head_sha=wt_head,
         )
+
+    def _worktree_head(self, path: Path, base: str, require_base: bool) -> str:
+        head = _run_git(["rev-parse", "HEAD"], path).stdout.strip()
+        if not require_base or _run_git(["merge-base", "--is-ancestor", base, head], path, check=False).returncode == 0:
+            return head
+        can_advance = _run_git(["merge-base", "--is-ancestor", head, base], path, check=False).returncode == 0
+        if not can_advance or _run_git(["status", "--porcelain"], path).stdout.strip():
+            raise WorktreeError("Existing worktree is dirty or divergent from the required dependency base")
+        _run_git(["-c", "core.hooksPath=/dev/null", "merge", "--ff-only", base], path)
+        return base
 
     def find_commit_by_assignment_id(
         self,

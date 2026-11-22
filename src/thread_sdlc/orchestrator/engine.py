@@ -1,6 +1,7 @@
 """Repository-local workflow shared by human review, CLI and Copilot tools."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import subprocess
@@ -17,12 +18,15 @@ from thread_sdlc.state.db import StateDatabase
 from thread_sdlc.state.events import EventLogger
 from thread_sdlc.state.models import AnnotationRecord, CheckpointRecord, ThreadRecord, TicketRecord, VerificationRunRecord
 from thread_sdlc.state.repositories import StateRepository
-from thread_sdlc.workers.adapter import MockWorkerAdapter
+from thread_sdlc.workers import goldfish
+from thread_sdlc.workers.adapter import MockWorkerAdapter, PausedQuota, WorkerAssignment
 from thread_sdlc.workers.copilot_cli import CopilotCliSubprocessAdapter
 from thread_sdlc.workers.copilot_sdk import CopilotSdkAdapter, probe_sdk
 from thread_sdlc.workers.manager import WorkerManager
-from thread_sdlc.workers.worktree import WorktreeManager
+from thread_sdlc.workers.permissions import RolePolicy
+from thread_sdlc.workers.worktree import WorktreeError, WorktreeManager
 
+from .integration import combine
 from .router import classify, protected
 
 
@@ -101,6 +105,7 @@ class Workflow:
 
     def _refresh(self, thread_id: str) -> ThreadRecord:
         with self.db.transaction():
+            self.bundle = load_all(self.root)
             t = self._thread(thread_id)
             if t.status in ("Completed", "Merging"):
                 return t
@@ -130,11 +135,14 @@ class Workflow:
             thread_id = latest.id
         t = self._refresh(thread_id)
         cps = self.repo.list_checkpoints(t.id)
-        return {"thread": t.model_dump(), "tickets": [v.model_dump() for v in self.repo.list_tickets(t.id)],
+        snapshot = {"thread": t.model_dump(), "tickets": [v.model_dump() for v in self.repo.list_tickets(t.id)],
                 "checkpoints": [v.model_dump() for v in cps],
                 "annotations": [v.model_dump() for cp in cps for v in self.repo.list_annotations(cp.id)],
                 "events": [v.model_dump() for v in self.events.list_events(t.id)],
                 "verification_runs": [v.model_dump() for v in self.repo.list_verification_runs(t.id)]}
+        if self.bundle.config.features.m3a:
+            snapshot["integration"] = self.integration_status(t.id)
+        return snapshot
 
     def _escalate(self, t: ThreadRecord, paths: list[str]) -> bool:
         cap = self.bundle.policy.tracks.for_track(t.track).max_files
@@ -160,6 +168,7 @@ class Workflow:
             graph = {x.id: x.depends_on for x in existing}
             graph.update({x.id: x.depends_on for x in proposed})
             for item in proposed:
+                _require(not self.bundle.config.features.m3a or item.id != "integration", "Reserved integration branch name")
                 old = self.repo.get_ticket(item.id)
                 _require(old is None or old.thread_id == t.id, "Ticket ID already in use")
                 _require(item.role in self.bundle.scope.roles and set(item.depends_on) <= graph.keys(), "Unknown role or dependency")
@@ -253,6 +262,103 @@ class Workflow:
             return CopilotSdkAdapter(policy)
         return CopilotCliSubprocessAdapter(policy)
 
+    def _review_adapter(self, policy: RolePolicy):
+        if self.bundle.config.adapter == "mock":
+            return MockWorkerAdapter(policy, scenario="readonly_review")
+        return self._adapter(policy)
+
+    def _goldfish_checkpoint(self, thread_id: str, checkpoint_id: str) -> tuple[ThreadRecord, CheckpointRecord]:
+        t = self._refresh(thread_id)
+        _require(self.bundle.config.features.m3b, "Goldfish reviews are disabled")
+        cp = self._checkpoint(checkpoint_id)
+        _require(cp.thread_id == t.id and cp.stage in ("spec", "diff") and cp.status in ("pending", "approved")
+                 and cp.content_sha256 == _digest(cp.content_md) and t.status not in ("Completed", "Merging"),
+                 "Review requires a current spec or diff checkpoint")
+        if cp.stage == "spec":
+            _require(cp.git_head_sha == t.base_sha, "Review checkpoint base moved")
+        else:
+            proposal = (self.integration_diff(t.id) if self.bundle.config.features.m3a
+                        else self.diff(self._latest_proposal(t.id).id))
+            _require(cp.git_head_sha == proposal["head_sha"] and cp.content_md == proposal["diff"],
+                     "Review checkpoint proposal changed")
+        return t, cp
+
+    async def goldfish_review(
+        self, thread_id: str, checkpoint_id: str, profiles: list[str] | None = None,
+    ) -> dict:
+        """Review a spec or diff in separately isolated, fresh read-only sessions."""
+        with self.db.transaction() as conn:
+            t, cp = self._goldfish_checkpoint(thread_id, checkpoint_id)
+            bundle = self.bundle
+            used = conn.execute(
+                "SELECT count(*) FROM events WHERE thread_id = ? AND type = 'goldfish_started'", (t.id,),
+            ).fetchone()[0]
+            available = bundle.policy.caps.max_goldfish_reviews - used
+            _require(available > 0, "Goldfish review cap reached")
+            selected = list(goldfish.PROFILES)[:available] if profiles is None else profiles
+            _require(bool(selected) and len(set(selected)) == len(selected)
+                     and set(selected) <= goldfish.PROFILES.keys(), "Supply distinct supported review profiles")
+            _require(len(selected) <= available, "Goldfish review cap reached")
+            constitution = redact_text(_git(self.root, "show", f"{t.base_sha}:.thread/constitution.md"))
+            attempts = []
+            for profile in selected:
+                attempt = {"review_id": f"review-{uuid4().hex}", "checkpoint_id": cp.id,
+                           "profile": profile, "commit_sha": cp.git_head_sha}
+                self.events.emit(t.id, "goldfish_started", attempt)
+                attempts.append(attempt)
+
+        reviews = []
+        for attempt in attempts:
+            details = dict(attempt)
+            try:
+                worktree = self.worktrees.detached_checkout(cp.git_head_sha)
+                with worktree as path:
+                    policy = RolePolicy(role="reviewer_readonly", worktree_root=path, readonly=True)
+                    adapter = self._review_adapter(policy)
+                    remaining = bundle.policy.caps.max_credits_per_thread - self._thread(t.id).credits_used
+                    _require(remaining > 0, "Thread credit budget exhausted")
+                    assignment = WorkerAssignment(
+                        assignment_id=attempt["review_id"], thread_id=t.id, ticket_id=cp.id,
+                        role=policy.role, instructions=goldfish.instructions(
+                            attempt["profile"], constitution, cp.stage, cp.content_md,
+                        ),
+                        worktree_path=path, base_sha=cp.git_head_sha,
+                        max_turns=bundle.policy.caps.max_turns_per_assignment, max_credits=remaining,
+                        metadata={"purpose": "goldfish"},
+                    )
+                    try:
+                        findings = await goldfish.collect_review(adapter, assignment, policy)
+                    finally:
+                        try:
+                            await adapter.disconnect()
+                        finally:
+                            usage = adapter.usage_metrics()
+                            self.repo.increment_thread_usage(
+                                t.id, credits_delta=usage.credits_used, turns_delta=usage.turns_used,
+                            )
+                    _require(_git(path, "rev-parse", "HEAD") == cp.git_head_sha and
+                             not _git(path, "status", "--porcelain"), "Reviewer changed its checkout")
+                with self.db.transaction():
+                    _, current = self._goldfish_checkpoint(t.id, cp.id)
+                    _require(self.bundle == bundle and current.content_sha256 == cp.content_sha256
+                             and current.git_head_sha == cp.git_head_sha, "Checkpoint changed during review")
+                    for finding in findings:
+                        self.repo.create_annotation(AnnotationRecord(
+                            id=f"note-{uuid4().hex}", checkpoint_id=cp.id, target_type="goldfish",
+                            file_path=finding["path"], line_or_section=str(finding["line"]) if finding["line"] else None,
+                            comment=f'{attempt["profile"]} ({finding["severity"]}): {finding["summary"]}',
+                        ))
+                    details.update(status="completed", findings=findings)
+                    self.events.emit(t.id, "goldfish_completed", details)
+            except asyncio.CancelledError:
+                self.events.emit(t.id, "goldfish_failed", {**details, "error": "Review cancelled"})
+                raise
+            except Exception as exc:
+                details.update(status="failed", error=redact_text(str(exc)))
+                self.events.emit(t.id, "goldfish_failed", details)
+            reviews.append(details)
+        return {"thread_id": t.id, "checkpoint_id": cp.id, "reviews": reviews}
+
     def _latest_proposal(self, thread_id: str) -> TicketRecord:
         completed = [x for x in self.repo.list_tickets(thread_id) if x.status == "done" and x.result_sha]
         for ticket in reversed(completed):
@@ -263,6 +369,98 @@ class Workflow:
     def _ancestor(self, ancestor: str, head: str) -> bool:
         return subprocess.run(["git","merge-base","--is-ancestor",ancestor,head], cwd=self.root, capture_output=True).returncode == 0
 
+    def _parallel_heads(self, thread_id: str, dependencies: list[str] | None = None) -> list[tuple[str, str]]:
+        tickets = {ticket.id: ticket for ticket in self.repo.list_tickets(thread_id)}
+        selected = set(tickets) if dependencies is None else set(dependencies)
+        stack = list(selected)
+        while stack:
+            ticket = tickets[stack.pop()]
+            for dependency in ticket.depends_on:
+                if dependency not in selected:
+                    selected.add(dependency)
+                    stack.append(dependency)
+        graph = {key: sorted(tickets[key].depends_on) for key in sorted(selected)}
+        heads = []
+        for key in TopologicalSorter(graph).static_order():
+            ticket = tickets[key]
+            _require(ticket.status == "done" and bool(ticket.result_sha), "All integration tickets must be complete")
+            heads.append((key, self.diff(key)["head_sha"]))
+        return heads
+
+    def _integration_ref(self, thread_id: str) -> str:
+        return "refs/heads/" + self.worktrees.branch_name(thread_id, "integration")
+
+    def _integration_head(self, thread_id: str) -> str | None:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", self._integration_ref(thread_id) + "^{commit}"],
+            cwd=self.root, text=True, capture_output=True, check=False,
+        )
+        _require(result.returncode in (0, 1), "Could not read integration branch")
+        return result.stdout.strip() or None
+
+    def _combine_head(self, t: ThreadRecord, heads: list[tuple[str, str]], *, publish: bool = False) -> str:
+        previous = self._integration_head(t.id) if publish else None
+        try:
+            with self.worktrees.detached_checkout(t.base_sha) as path:
+                combine(path, heads)
+                head = _git(path, "rev-parse", "HEAD")
+        except WorktreeError as exc:
+            raise InvalidTransitionError(redact_text(str(exc))) from exc
+        if publish and head != previous:
+            _git(self.root, "update-ref", self._integration_ref(t.id), head, previous or "0" * len(head))
+        return head
+
+    def integration_status(self, thread_id: str) -> dict:
+        """Read the published integration branch without building a proposal."""
+        _require(self.bundle.config.features.m3a, "Parallel integration is disabled")
+        t = self._thread(thread_id)
+        return {
+            "branch": self.worktrees.branch_name(t.id, "integration"),
+            "head_sha": self._integration_head(t.id),
+            "base_sha": t.base_sha,
+        }
+
+    def integration_diff(self, thread_id: str) -> dict:
+        """Return the current combined proposal for the authenticated reviewer."""
+        t = self._thread(thread_id)
+        head = self.integration_status(thread_id)["head_sha"]
+        heads = self._parallel_heads(thread_id)
+        _require(bool(head) and bool(heads) and self._ancestor(t.base_sha, head)
+                 and all(self._ancestor(sha, head) for _, sha in heads), "No current combined proposal")
+        return {"thread_id": t.id, "base_sha": t.base_sha, "head_sha": head,
+                "target_branch": self.bundle.policy.base_branch,
+                "diff": redact_text(_git(self.root, "diff", "--no-ext-diff", "--no-textconv", t.base_sha, head, "--"))}
+
+    async def dispatch_ready(self, thread_id: str, instructions: dict[str, str] | None = None) -> dict:
+        """Run one wave of dependency-ready tickets under the repository worker cap."""
+        with self.db.transaction():
+            t = self._refresh(thread_id)
+            _require(self.bundle.config.features.m3a, "Parallel dispatch is disabled")
+            _require(t.status == "Executing", "Dispatch requires an executing thread")
+            self._check_documents(t)
+            tickets = self.repo.list_tickets(t.id)
+            done = {ticket.id for ticket in tickets if ticket.status == "done"}
+            running = {row.ticket_id for row in self.repo.list_running_assignments(t.id)}
+            _require(set(instructions or ()) <= {ticket.id for ticket in tickets}, "Unknown ticket instructions")
+            ready = [ticket for ticket in tickets if ticket.id not in running and ticket.id not in done
+                     and set(ticket.depends_on) <= done]
+            available = max(0, self.bundle.policy.caps.max_workers_per_thread - len(running))
+            wave = ready[:available]
+        outcome = await asyncio.gather(*(
+            self.dispatch_worker(t.id, ticket.id, (instructions or {}).get(ticket.id, ticket.title))
+            for ticket in wave
+        ), return_exceptions=True)
+        results = {}
+        for ticket, result in zip(wave, outcome):
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            if isinstance(result, Exception):
+                status = "paused_quota" if isinstance(result, PausedQuota) else "failed"
+                results[ticket.id] = {"status": status, "error": redact_text(str(result))}
+            else:
+                results[ticket.id] = result
+        return {"results": results, "deferred": [ticket.id for ticket in ready[available:]]}
+
     async def dispatch_worker(self, thread_id: str, ticket_id: str, instructions: str) -> dict:
         with self.db.transaction():
             t = self._refresh(thread_id)
@@ -272,11 +470,28 @@ class Workflow:
             _require(all(self._ticket(dep).status == "done" for dep in ticket.depends_on), "Ticket dependencies are incomplete")
             if ticket.status == "done":
                 return {"status":"completed", "result_sha":ticket.result_sha,"worker_invoked":False}
-            completed = [x for x in self.repo.list_tickets(t.id) if x.status == "done"]
-            base = self._latest_proposal(t.id).result_sha if completed else t.base_sha
-            self.worktrees.ensure_worktree(t.id, ticket.id, base)
-        manager = WorkerManager(repo_root=self.root,db=self.db,policy=self.bundle.policy,scope=self.bundle.scope,adapter_factory=self._adapter)
-        result = await manager.dispatch_ticket(thread_id,ticket_id,instructions)
+            bundle = self.bundle
+            parallel = bundle.config.features.m3a
+            if parallel:
+                _require(ticket.id != "integration", "Reserved integration branch name")
+                base = self._combine_head(t, self._parallel_heads(t.id, ticket.depends_on)) if ticket.depends_on else t.base_sha
+            else:
+                completed = [x for x in self.repo.list_tickets(t.id) if x.status == "done"]
+                base = self._latest_proposal(t.id).result_sha if completed else t.base_sha
+
+        def confirm_assignment() -> None:
+            current = self._refresh(thread_id)
+            _require(self.bundle == bundle and current.base_sha == t.base_sha and current.status == "Executing",
+                     "Policy or execution stage changed before dispatch")
+            self._check_documents(current)
+            _require(self._ticket(ticket.id) == ticket, "Ticket changed before dispatch")
+
+        policy = bundle.policy
+        if not parallel and policy.caps.max_workers_per_thread != 1:
+            policy = policy.model_copy(update={"caps": policy.caps.model_copy(update={"max_workers_per_thread": 1})})
+        manager = WorkerManager(repo_root=self.root, db=self.db, policy=policy, scope=bundle.scope, adapter_factory=self._adapter)
+        result = await manager.dispatch_ticket(thread_id, ticket_id, instructions, base_ref=base,
+                                               before_reservation=confirm_assignment, parallel=parallel)
         return result.model_dump(mode="json")
 
     def diff(self, ticket_id: str) -> dict:
@@ -290,30 +505,49 @@ class Workflow:
 
     def verify(self, thread_id: str, ticket_id: str | None = None) -> dict:
         from thread_sdlc.governance.engine import verify_repository
-        t = self._refresh(thread_id)
-        _require(t.status in ("Executing", "Verifying", "WaitingDiffApproval"), "Execution approval required before verifying")
-        self._check_documents(t)
-        ticket = self._ticket(ticket_id) if ticket_id else self._latest_proposal(t.id)
-        _require(ticket.thread_id == t.id, "Ticket belongs to another thread")
-        proposal = self.diff(ticket.id)
-        head = proposal["head_sha"]
-        wt = self.worktrees.worktree_path_for(ticket.id)
-        _require(_git(wt,"rev-parse","HEAD") == head and not _git(wt,"status","--porcelain"), "Verification requires a clean proposal")
-        paths = _git(wt,"diff","--name-only","--no-renames","-z",t.base_sha,head,"--").split("\x00")
         with self.db.transaction():
+            t = self._refresh(thread_id)
+            bundle = self.bundle
+            parallel = bundle.config.features.m3a
+            _require(t.status in ("Executing", "Verifying", "WaitingDiffApproval"), "Execution approval required before verifying")
+            self._check_documents(t)
+            ticket = self._ticket(ticket_id) if ticket_id else None
+            _require(ticket is None or ticket.thread_id == t.id, "Ticket belongs to another thread")
+            if parallel:
+                _require(not self.repo.list_running_assignments(t.id), "Wait for all running tickets before integration")
+                heads = self._parallel_heads(t.id)
+                _require(bool(heads), "No integration tickets to verify")
+                self._combine_head(t, heads, publish=True)
+                proposal = self.integration_diff(t.id)
+            else:
+                ticket = ticket or self._latest_proposal(t.id)
+                proposal = self.diff(ticket.id)
+                wt = self.worktrees.worktree_path_for(ticket.id)
+                _require(_git(wt, "rev-parse", "HEAD") == proposal["head_sha"] and
+                         not _git(wt, "status", "--porcelain"), "Verification requires a clean proposal")
+            head = proposal["head_sha"]
+            paths = _git(self.root, "diff", "--name-only", "--no-renames", "-z", t.base_sha, head, "--").split("\x00")
             if self._escalate(t,[p for p in paths if p]):
                 return {"passed": False,"status":"Escalated","thread":self._thread(t.id).model_dump()}
+            self._stale(t.id, ("diff",))
             self.repo.update_thread(t.id,status="Verifying")
-        report = verify_repository(wt, base_sha=t.base_sha)
+
+        if parallel:
+            with self.worktrees.detached_checkout(head) as wt:
+                report = verify_repository(wt, base_sha=t.base_sha)
+        else:
+            report = verify_repository(wt, base_sha=t.base_sha)
         with self.db.transaction():
             current = self._refresh(t.id)
-            _require(current.status == "Verifying" and current.base_sha == t.base_sha and report.commit_sha == head == self.diff(ticket.id)["head_sha"], "Proposal or review stage changed during verification")
+            current_proposal = self.integration_diff(t.id) if parallel else self.diff(ticket.id)
+            _require(self.bundle == bundle and current.status == "Verifying" and current.base_sha == t.base_sha
+                     and report.commit_sha == head == current_proposal["head_sha"],
+                     "Proposal or review stage changed during verification")
             run = VerificationRunRecord(id=f"run-{uuid4().hex}",thread_id=t.id,commit_sha=head,mode="local",passed=report.passed,scorecard=report.scorecard,rule_evidence=report.rule_evidence)
             self.repo.create_verification_run(run)
-            self._stale(t.id, ("diff",))
             next_stage = "Executing"
             tickets = self.repo.list_tickets(t.id)
-            if report.passed and all(x.status == "done" for x in tickets) and self._latest_proposal(t.id).result_sha == head:
+            if report.passed and all(x.status == "done" for x in tickets) and (parallel or self._latest_proposal(t.id).result_sha == head):
                 content = proposal["diff"]
                 cp = CheckpointRecord(id=f"cp-{uuid4().hex}",thread_id=t.id,stage="diff",content_md=content,content_sha256=_digest(content),git_head_sha=head,gate_type="diff",permitted_next_stage="Completed",waits_for_person=True)
                 self.repo.create_checkpoint(cp)
@@ -329,8 +563,17 @@ class Workflow:
 
     def merge(self, ticket_id: str, expected_head: str, expected_base: str) -> dict:
         ticket = self._ticket(ticket_id)
+        return self._merge(ticket.thread_id, ticket_id, expected_head, expected_base)
+
+    def merge_integration(self, thread_id: str, expected_head: str, expected_base: str) -> dict:
+        """Apply human approval only to the exact verified combined proposal."""
+        return self._merge(thread_id, None, expected_head, expected_base)
+
+    def _merge(self, thread_id: str, ticket_id: str | None, expected_head: str, expected_base: str) -> dict:
         with self.db.transaction():
-            t = self._refresh(ticket.thread_id)
+            t = self._refresh(thread_id)
+            _require((ticket_id is None) == self.bundle.config.features.m3a,
+                     "Use the merge operation matching the active integration mode")
             intent = self._merge_intent(t.id)
             if t.status in ("Completed","Merging"):
                 _require(intent is not None and (ticket_id,expected_head,expected_base)==(intent["ticket_id"],intent["head"],intent["base"]), "Different merge already recorded")
@@ -342,14 +585,17 @@ class Workflow:
                 cp = self.repo.get_latest_checkpoint(t.id,"diff")
                 run = self.repo.get_latest_verification_run(t.id,expected_head)
                 _require(cp is not None and cp.status=="pending" and cp.git_head_sha == expected_head and run is not None and run.passed, "Current verification and diff review required")
-                proposal = self.diff(ticket.id)
-                _require(self._latest_proposal(t.id).result_sha == proposal["head_sha"] == expected_head and self._target() == t.base_sha == expected_base,"Review revision or target moved")
+                proposal = self.integration_diff(t.id) if ticket_id is None else self.diff(ticket_id)
+                _require(proposal["head_sha"] == expected_head and self._target() == t.base_sha == expected_base,
+                         "Review revision or target moved")
+                _require(ticket_id is None or self._latest_proposal(t.id).result_sha == expected_head,
+                         "Review the final ticket proposal")
                 _require(
                     cp.content_sha256 == _digest(cp.content_md) and cp.content_md == proposal["diff"],
                     "Reviewed diff content differs from the proposal",
                 )
                 _require(all(x.status=="done" for x in self.repo.list_tickets(t.id)) and self._ancestor(expected_base,expected_head),"All tickets must be ready on a fast-forward proposal")
-                intent = {"ticket_id":ticket.id,"head":expected_head,"base":expected_base,"checkpoint":cp.id,"target":self.bundle.policy.base_branch}
+                intent = {"ticket_id":ticket_id,"head":expected_head,"base":expected_base,"checkpoint":cp.id,"target":self.bundle.policy.base_branch}
                 self.events.emit(t.id,"merge_intent",intent)
                 self.repo.update_thread(t.id,status="Merging")
 

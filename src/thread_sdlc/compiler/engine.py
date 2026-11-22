@@ -12,6 +12,7 @@ import yaml
 
 from thread_sdlc.compiler.ci import generate_ci
 from thread_sdlc.config.detector import build_initial_configs, detect_stack
+from thread_sdlc.config.models import ThreadConfig
 from thread_sdlc.mcp_server.registry import TOOL_REGISTRY
 
 START = "<!-- thread:managed:start -->"
@@ -110,8 +111,11 @@ def changes(root: Path, *, initialize: bool = False) -> dict[Path, tuple[str, st
                 rendered[name] = value
     elif not (root / ".thread/config.yaml").is_file():
         raise ValueError("Initialize the repository with thread init first.")
-    tools = "\n".join(f"- `{name}`" for name in TOOL_REGISTRY)
-    tool_ids = "\n".join(f"  - thread/{name}" for name in TOOL_REGISTRY)
+    config_path = ".thread/config.yaml"
+    config_yaml = rendered[config_path] if config_path in rendered else read(config_path)
+    registry = TOOL_REGISTRY.for_config(ThreadConfig.model_validate(yaml.safe_load(config_yaml)))
+    tools = "\n".join(f"- `{name}`" for name in registry)
+    tool_ids = "\n".join(f"  - thread/{name}" for name in registry)
     template = (Path(__file__).parent / "templates/thread-agent.md").read_text()
     rendered[".github/agents/thread.agent.md"] = template.replace("{{TOOLS}}", tools).replace("{{TOOL_IDS}}", tool_ids)
     for name in ("AGENTS.md", ".github/copilot-instructions.md"):

@@ -5,14 +5,20 @@ import asyncio
 import json
 import secrets
 from pathlib import Path
+from typing import Literal
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 
+from thread_sdlc.config.loader import ConfigLoadError
 from thread_sdlc.state import StateDatabase, StateRepository, EventLogger
 from thread_sdlc.orchestrator.engine import Workflow, InvalidTransitionError
+from .studio import (
+    ConfigName, MAX_CONFIG_BYTES, list_observations, mission_control_status, promote_observation,
+    read_config, save_config,
+)
 
 
 class Note(BaseModel):
@@ -34,7 +40,17 @@ class Merge(BaseModel):
     expected_base: str
 
 
+class PromoteObservation(BaseModel):
+    confirm: StrictBool
+
+
+class ConfigEdit(BaseModel):
+    yaml: str = Field(max_length=MAX_CONFIG_BYTES)
+    expected_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 def create_app(repo_root: Path, token: str, port: int) -> FastAPI:
+    repo_root = repo_root.resolve()
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     origin = f"http://127.0.0.1:{port}"
     host = f"127.0.0.1:{port}"
@@ -71,7 +87,7 @@ def create_app(repo_root: Path, token: str, port: int) -> FastAPI:
     async def conflict(request, exc):
         return JSONResponse({"detail": str(exc)}, 409)
 
-    for cls in {InvalidTransitionError, ValueError, RuntimeError, PermissionError}:
+    for cls in {InvalidTransitionError, ValueError, RuntimeError, PermissionError, ConfigLoadError}:
         app.add_exception_handler(cls, conflict)
 
     @app.exception_handler(KeyError)
@@ -120,9 +136,67 @@ def create_app(repo_root: Path, token: str, port: int) -> FastAPI:
     def merge(identifier: str, intent: Merge):
         return Workflow(repo_root).merge(identifier, **intent.model_dump())
 
+    @app.get("/api/threads/{identifier}/proposal")
+    def integration_proposal(identifier: str):
+        return Workflow(repo_root).integration_diff(identifier)
+
+    @app.post("/api/threads/{identifier}/merge")
+    def merge_integration(identifier: str, intent: Merge):
+        return Workflow(repo_root).merge_integration(identifier, **intent.model_dump())
+
     @app.post("/api/threads/{identifier}/resume")
     def resume(identifier: str):
         return Workflow(repo_root).start_or_resume(thread_id=identifier)
+
+    @app.get("/api/mission-control")
+    def mission_control():
+        return mission_control_status(repo_root)
+
+    def require_mission_control(*, graph: bool = False):
+        if not mission_control_status(repo_root)["graph_enabled" if graph else "enabled"]:
+            raise HTTPException(status_code=404, detail="This Mission Control feature is disabled")
+
+    @app.get("/api/mission-control/graph")
+    def knowledge_graph(
+        query: str = Query(default="", max_length=250),
+        provenance: Literal["observed", "inferred"] | None = None,
+        limit: int = Query(default=30, ge=1, le=100),
+    ):
+        require_mission_control(graph=True)
+        from thread_sdlc.context import ContextIndex
+
+        return ContextIndex(repo_root).graph(query=query, provenance=provenance, limit=limit)
+
+    @app.get("/api/mission-control/observations")
+    def observations(limit: int = Query(default=30, ge=1, le=100)):
+        require_mission_control()
+        return {"observations": list_observations(repo_root, db, limit)}
+
+    @app.post("/api/mission-control/observations/{identifier}/promote")
+    def promote(identifier: int, intent: PromoteObservation):
+        require_mission_control()
+        if not intent.confirm:
+            raise HTTPException(status_code=422, detail="Confirm promotion after reviewing the observation")
+        try:
+            return promote_observation(repo_root, db, identifier)
+        except OSError:
+            raise HTTPException(status_code=409, detail="Could not safely write the decision record") from None
+
+    @app.get("/api/mission-control/config/{name}")
+    def studio_config(name: ConfigName):
+        require_mission_control()
+        try:
+            return read_config(repo_root, name)
+        except OSError:
+            raise HTTPException(status_code=409, detail="Could not safely read the configuration file") from None
+
+    @app.post("/api/mission-control/config/{name}")
+    def edit_studio_config(name: ConfigName, edit: ConfigEdit):
+        require_mission_control()
+        try:
+            return save_config(repo_root, db, name, edit.yaml, edit.expected_revision)
+        except OSError:
+            raise HTTPException(status_code=409, detail="Could not safely write the configuration file") from None
 
     static = Path(__file__).parent / "static"
     app.mount("/assets", StaticFiles(directory=static / "assets", check_dir=False), name="assets")
@@ -131,6 +205,12 @@ def create_app(repo_root: Path, token: str, port: int) -> FastAPI:
     @app.get("/tasks/{identifier}")
     @app.get("/tasks/{identifier}/reviews/{review_id}")
     def index():
+        return FileResponse(static / "index.html")
+
+    @app.get("/mission-control")
+    @app.get("/mission-control/{view}")
+    def mission_control_page(view: Literal["knowledge", "memory", "policy"] = "knowledge"):
+        require_mission_control()
         return FileResponse(static / "index.html")
 
     return app

@@ -185,6 +185,9 @@ export function Review({data, cp, online, refresh}: ReviewProps) {
     ? [...data.tickets].reverse().find(item => item.status === 'done' && item.result_sha === cp.git_head_sha && item.worktree_branch)
     : undefined
   const ticketId = ticket?.id
+  const combined = Boolean(data.integration)
+  const proposalBase = combined ? 'threads/' + encodeURIComponent(data.thread.id) :
+    ticketId ? 'tickets/' + encodeURIComponent(ticketId) : null
   const [proposal, setProposal] = useState<Proposal | null>(null)
   const [proposalError, setProposalError] = useState('')
   const [proposalAttempt, retryProposal] = useState(0)
@@ -198,21 +201,21 @@ export function Review({data, cp, online, refresh}: ReviewProps) {
   const endpoint = 'checkpoints/' + encodeURIComponent(cp.id)
 
   useEffect(() => {
-    if (!ticketId || !canSubmitMerge) return
+    if (!proposalBase || !canSubmitMerge) return
     let current = true
     setProposal(null)
     setProposalError('')
-    void api<Proposal>('tickets/' + encodeURIComponent(ticketId) + '/diff').then(value => {
+    void api<Proposal>(proposalBase + (combined ? '/proposal' : '/diff')).then(value => {
       if (current) setProposal(value)
     }, err => {
       if (current) setProposalError(err instanceof Error ? err.message : 'Proposal unavailable')
     })
     return () => { current = false }
-  }, [canSubmitMerge, cp.git_head_sha, data.thread.base_sha, proposalAttempt, ticketId])
+  }, [canSubmitMerge, combined, cp.git_head_sha, data.thread.base_sha, proposalAttempt, proposalBase])
 
   const matchingProposal = proposal && proposal.head_sha === cp.git_head_sha &&
     proposal.base_sha === data.thread.base_sha && proposal.diff === cp.content_md
-  const canMerge = matchingProposal && run?.passed && ticketId
+  const canMerge = matchingProposal && run?.passed && proposalBase
 
   function selectTarget(value: CommentTarget) {
     setTarget(value)
@@ -251,8 +254,8 @@ export function Review({data, cp, online, refresh}: ReviewProps) {
   }
 
   function merge() {
-    if (!canSubmitMerge || pending || !canMerge || !ticketId || !proposal) return
-    void act(() => api('tickets/' + encodeURIComponent(ticketId) + '/merge', {
+    if (!canSubmitMerge || pending || !canMerge || !proposalBase || !proposal) return
+    void act(() => api(proposalBase + '/merge', {
       expected_head: cp.git_head_sha, expected_base: proposal.base_sha
     }), 'Worktree merged.')
   }
@@ -283,8 +286,8 @@ export function Review({data, cp, online, refresh}: ReviewProps) {
           {canSubmitMerge ? <>
             {matchingProposal && <p className="meta">Merge into <code>{proposal.target_branch}</code></p>}
             {proposalError && <div className="notice">{proposalError} <button type="button" onClick={() => retryProposal(count => count + 1)}>Check proposal again</button></div>}
-            {!proposalError && !canMerge && <p className="quiet">{ticketId && !proposal ? 'Checking the verified proposal…' : 'The current proposal and verification must match this revision before merge.'}</p>}
-            <button type="button" className="primary" disabled={pending || !canMerge} onClick={merge}>{merging ? 'Retry merge' : 'Approve & merge worktree'}</button>
+            {!proposalError && !canMerge && <p className="quiet">{proposalBase && !proposal ? 'Checking the verified proposal…' : 'The current proposal and verification must match this revision before merge.'}</p>}
+            <button type="button" className="primary" disabled={pending || !canMerge} onClick={merge}>{merging ? 'Retry merge' : combined ? 'Approve & merge combined proposal' : 'Approve & merge worktree'}</button>
           </> : <button type="button" className="primary" disabled={pending} onClick={() => void decide('approved')}>Approve {cp.stage}</button>}
           {canDecide && <form className="decision-form" onSubmit={event => {event.preventDefault(); void decide('changes_requested')}}>
             <label htmlFor="review-reason">Reason for requesting changes</label>

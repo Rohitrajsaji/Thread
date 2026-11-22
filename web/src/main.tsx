@@ -2,6 +2,8 @@ import {useCallback,useEffect,useRef,useState} from 'react'
 import {createRoot} from 'react-dom/client'
 import {api,Checkpoint,date,HttpError,label,reviewPath,Snapshot,stageText,taskPath,Thread,title} from './model'
 import {Review} from './review'
+import {MissionControl} from './mission'
+import type {MissionAvailability, MissionView} from './mission'
 import './style.css'
 
 function Overview({data}:{data:Snapshot}){
@@ -23,11 +25,22 @@ function routeId(value: string | undefined) {
 }
 
 function App(){
-  const [, , taskSegment, , reviewSegment]=window.location.pathname.split('/')
-  const task=routeId(taskSegment),review=routeId(reviewSegment)
+  const [, area, taskSegment, , reviewSegment]=window.location.pathname.split('/')
+  const missionView: MissionView | null = area === 'mission-control'
+    ? (taskSegment === 'memory' || taskSegment === 'policy' ? taskSegment : 'knowledge') : null
+  const task=area === 'tasks' ? routeId(taskSegment) : undefined,review=routeId(reviewSegment)
   const [data,setData]=useState<Snapshot|null>(null),[tasks,setTasks]=useState<Thread[]>([])
   const [connection,setConnection]=useState('Connecting'),[error,setError]=useState('')
+  const [mission,setMission]=useState<MissionAvailability|null>(null)
   const latestRequest=useRef(0)
+  useEffect(()=>{
+    let current = true
+    api<MissionAvailability>('mission-control').then(
+      value => { if (current) setMission(value) },
+      () => { if (current) setMission({enabled: false, graph_enabled: false}) },
+    )
+    return () => { current = false }
+  },[])
   const refresh=useCallback(async()=>{
     const request=++latestRequest.current
     try{
@@ -43,7 +56,10 @@ function App(){
       setError(e instanceof Error?e.message:'Unable to reach the local service')
     }
   },[task])
-  useEffect(()=>{void refresh();const id=setInterval(refresh,5000);window.addEventListener('focus',refresh);return()=>{clearInterval(id);window.removeEventListener('focus',refresh)}},[refresh])
+  useEffect(()=>{
+    if(missionView)return
+    void refresh();const id=setInterval(refresh,5000);window.addEventListener('focus',refresh);return()=>{clearInterval(id);window.removeEventListener('focus',refresh)}
+  },[missionView,refresh])
   const threadId=data?.thread.id
   const lastEvent=data?.events.at(-1)?.id ?? 0
   const eventCursor=useRef(lastEvent)
@@ -59,8 +75,11 @@ function App(){
     return ()=>{stream.close();window.clearTimeout(debounce)}
   },[threadId,connection==='Session expired',refresh])
   const cp=data?.checkpoints.find(c=>c.id===review)
-  return <><a className="skip" href="#content">Skip to content</a><header className="mast"><a href="/" className="brand">Thread</a><span className="mastsub">Local review</span><div className="grow"/>{tasks.length>1&&<label className="chooser">Task <select value={data?.thread.id??''} onChange={e=>location.assign(taskPath(e.target.value))}>{tasks.map(t=><option key={t.id} value={t.id}>{t.title}</option>)}</select></label>}<span className={'connection '+(connection==='Connected'?'online':'')}>{connection}</span></header>
+  return <><a className="skip" href="#content">Skip to content</a><header className="mast"><a href="/" className="brand">Thread</a><span className="mastsub">Local review</span><div className="grow"/>
+  {mission?.enabled&&<a href="/mission-control" aria-current={missionView?'page':undefined}>Mission Control</a>}
+  {tasks.length>1&&<label className="chooser">Task <select value={data?.thread.id??''} onChange={e=>location.assign(taskPath(e.target.value))}>{tasks.map(t=><option key={t.id} value={t.id}>{t.title}</option>)}</select></label>}{!missionView&&<span className={'connection '+(connection==='Connected'?'online':'')}>{connection}</span>}</header>
+  {missionView ? <MissionControl view={missionView} availability={mission}/> : <>
   {error&&<div role="alert" className="notice">{error} <button onClick={refresh}>Reconnect</button></div>}
-  {data?(review?(cp?<Review key={cp.id} data={data} cp={cp} online={connection==='Connected'} refresh={refresh}/>:<main id="content"><h1>Review unavailable</h1><a href={taskPath(data.thread.id)}>Open current task</a></main>):<Overview data={data}/>):<main id="content"><h1>{connection==='Connected'?'No active tasks':connection}</h1><p>{connection==='Connected'?'Start a task in Copilot Chat to review its progress here.':connection==='Session expired'?'Open the local link printed by thread ui.':'Waiting for the local review service.'}</p></main>}</>
+  {data?(review?(cp?<Review key={cp.id} data={data} cp={cp} online={connection==='Connected'} refresh={refresh}/>:<main id="content"><h1>Review unavailable</h1><a href={taskPath(data.thread.id)}>Open current task</a></main>):<Overview data={data}/>):<main id="content"><h1>{connection==='Connected'?'No active tasks':connection}</h1><p>{connection==='Connected'?'Start a task in Copilot Chat to review its progress here.':connection==='Session expired'?'Open the local link printed by thread ui.':'Waiting for the local review service.'}</p></main>}</>}</>
 }
 createRoot(document.getElementById('root')!).render(<App/>)

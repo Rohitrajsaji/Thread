@@ -98,19 +98,20 @@ class WorkerManager:
             base_sha=assignment.base_sha or None,
         )
         if res.reconciled and res.result_sha:
-            self.repo.update_assignment(
-                assignment.id,
-                status="reconciled_completed",
-                result_sha=res.result_sha,
-                ended_at=utc_now_iso(),
-            )
-            self.repo.update_ticket(
-                ticket.id,
-                status="done",
-                worktree_branch=res.branch,
-                worktree_path=str(res.worktree_path) if res.worktree_path else None,
-                result_sha=res.result_sha,
-            )
+            with self.db.transaction():
+                current = self.repo.get_assignment(assignment.id)
+                if current.status == "running":
+                    self.repo.increment_thread_usage(ticket.thread_id, credits_delta=current.credits_used,
+                                                     turns_delta=current.turns_used)
+                self.repo.update_assignment(
+                    assignment.id, status="reconciled_completed",
+                    result_sha=res.result_sha, ended_at=utc_now_iso(),
+                )
+                self.repo.update_ticket(
+                    ticket.id, status="done", worktree_branch=res.branch,
+                    worktree_path=str(res.worktree_path) if res.worktree_path else None,
+                    result_sha=res.result_sha,
+                )
             self.events.emit(
                 ticket.thread_id,
                 "assignment_reconciled",
@@ -202,28 +203,54 @@ class WorkerManager:
         credits_delta: float,
         turns_delta: int,
     ) -> None:
-        self.repo.update_assignment(
-            assignment_id,
-            status="paused_quota",
-            turns_used=turns_delta,
-            credits_used=credits_delta,
-            ended_at=utc_now_iso(),
-        )
-        self.repo.increment_thread_usage(
-            thread_id, credits_delta=credits_delta, turns_delta=turns_delta
-        )
-        self.repo.update_thread(thread_id, status="PausedQuota")
-        self.events.emit(
-            thread_id,
-            "quota_paused",
-            {
-                "assignment_id": assignment_id,
-                "limit_type": pq.limit_type,
-                "reason": pq.reason,
-                "credits_used": pq.credits_used,
-                "turns_used": pq.turns_used,
-            },
-        )
+        with self.db.transaction():
+            self._finish_usage(assignment_id, thread_id, "paused_quota",
+                               UsageMetrics(credits_used=credits_delta, turns_used=turns_delta))
+            self.repo.update_thread(thread_id, status="PausedQuota")
+            self.events.emit(
+                thread_id,
+                "quota_paused",
+                {
+                    "assignment_id": assignment_id,
+                    "limit_type": pq.limit_type,
+                    "reason": pq.reason,
+                    "credits_used": pq.credits_used,
+                    "turns_used": pq.turns_used,
+                },
+            )
+
+    def _finish_usage(
+        self, assignment_id: str, thread_id: str, status: str, usage: UsageMetrics,
+        result_sha: str | None = None,
+    ) -> None:
+        # Move usage from the running ledger to the thread total as one write.
+        with self.db.transaction():
+            current = self.repo.get_assignment(assignment_id)
+            if current is not None and current.status == "reconciled_completed":
+                credits = max(0.0, usage.credits_used - current.credits_used)
+                turns = max(0, usage.turns_used - current.turns_used)
+                self.repo.update_assignment(assignment_id, credits_used=current.credits_used + credits,
+                                            turns_used=current.turns_used + turns)
+            else:
+                self.repo.update_assignment(assignment_id, status=status, result_sha=result_sha,
+                                            turns_used=usage.turns_used, credits_used=usage.credits_used,
+                                            ended_at=utc_now_iso())
+                credits, turns = usage.credits_used, usage.turns_used
+            self.repo.increment_thread_usage(thread_id, credits_delta=credits, turns_delta=turns)
+
+    def _observe_parallel_budget(
+        self, thread_id: str, assignment_id: str, usage: UsageMetrics,
+    ) -> tuple[float, bool]:
+        with self.db.transaction():
+            assignment = self.repo.get_assignment(assignment_id)
+            if assignment is not None and assignment.status == "running":
+                self.repo.update_assignment(assignment_id, credits_used=usage.credits_used, turns_used=usage.turns_used)
+            thread = self.repo.get_thread(thread_id)
+            total = thread.credits_used + sum(a.credits_used for a in self.repo.list_running_assignments(thread_id))
+            if total >= self.policy.caps.max_credits_per_thread:
+                self.repo.update_thread(thread_id, status="PausedQuota")
+                return total, True
+            return total, thread.status == "PausedQuota"
 
     async def dispatch_ticket(
         self,
@@ -233,6 +260,9 @@ class WorkerManager:
         *,
         assignment_id: str | None = None,
         model: str | None = None,
+        base_ref: str | None = None,
+        before_reservation: Callable[[], None] | None = None,
+        parallel: bool = False,
     ) -> DispatchResult:
         """Reconcile any committed prior work, enforce caps, and dispatch a single worker."""
         thread = self.repo.get_thread(thread_id)
@@ -263,21 +293,24 @@ class WorkerManager:
         log_rel_path = f".thread-state/redacted-logs/{asgn_id}.log"
         trailer = self.worktree_manager.commit_trailer(asgn_id)
 
-        thread, ticket, rejection, meta = self.repo.reserve_running_assignment(
-            thread_id=thread_id,
-            assignment=AssignmentRecord(
-                id=asgn_id,
-                ticket_id=ticket_id,
-                adapter_type="pending",
-                status="running",
-                base_sha=thread.base_sha,
-                commit_trailer=trailer,
-                log_path=log_rel_path,
-            ),
-            max_workers_per_thread=self.policy.caps.max_workers_per_thread,
-            max_retries_per_ticket=self.policy.caps.max_retries_per_ticket,
-            max_credits_per_thread=self.policy.caps.max_credits_per_thread,
-        )
+        with self.db.transaction():
+            if before_reservation is not None:
+                before_reservation()
+            thread, ticket, rejection, meta = self.repo.reserve_running_assignment(
+                thread_id=thread_id,
+                assignment=AssignmentRecord(
+                    id=asgn_id,
+                    ticket_id=ticket_id,
+                    adapter_type="pending",
+                    status="running",
+                    base_sha=base_ref or thread.base_sha,
+                    commit_trailer=trailer,
+                    log_path=log_rel_path,
+                ),
+                max_workers_per_thread=self.policy.caps.max_workers_per_thread,
+                max_retries_per_ticket=self.policy.caps.max_retries_per_ticket,
+                max_credits_per_thread=self.policy.caps.max_credits_per_thread,
+            )
         if rejection == "paused_quota":
             raise PausedQuota(
                 f"Thread {thread_id} has exhausted credit budget "
@@ -309,9 +342,9 @@ class WorkerManager:
 
         # Step 3 & 4: Ensure isolated worktree and instantiate adapter; clean up on setup failure
         try:
-            base_ref = thread.base_sha or self.policy.base_branch
             worktree = self.worktree_manager.ensure_worktree(
-                thread_id, ticket_id, base_ref=base_ref
+                thread_id, ticket_id, base_ref=base_ref or thread.base_sha or self.policy.base_branch,
+                require_base=parallel,
             )
             role_policy = RolePolicy.from_scope_config(ticket.role, self.scope, worktree.path)
             adapter = self.adapter_factory(role_policy)
@@ -398,6 +431,10 @@ class WorkerManager:
                         committed_sha = evt.data["result_sha"]
 
                     usage_now = adapter.usage_metrics()
+                    used_credits = thread.credits_used + usage_now.credits_used
+                    paused = False
+                    if parallel:
+                        used_credits, paused = self._observe_parallel_budget(thread_id, asgn_id, usage_now)
                     if usage_now.turns_used >= self.policy.caps.max_turns_per_assignment:
                         pq = PausedQuota(
                             f"Turn cap reached ({usage_now.turns_used}/{self.policy.caps.max_turns_per_assignment})",
@@ -407,11 +444,11 @@ class WorkerManager:
                         )
                         await adapter.abort()
                         raise pq
-                    if thread.credits_used + usage_now.credits_used >= self.policy.caps.max_credits_per_thread:
+                    if paused or used_credits >= self.policy.caps.max_credits_per_thread:
                         pq = PausedQuota(
-                            f"Thread credit cap reached ({thread.credits_used + usage_now.credits_used}/{self.policy.caps.max_credits_per_thread})",
+                            f"Thread quota paused ({used_credits}/{self.policy.caps.max_credits_per_thread} credits)",
                             limit_type="credits",
-                            credits_used=thread.credits_used + usage_now.credits_used,
+                            credits_used=used_credits,
                             turns_used=usage_now.turns_used,
                         )
                         await adapter.abort()
@@ -433,18 +470,7 @@ class WorkerManager:
                 pass
             finally:
                 usage_now = adapter.usage_metrics()
-                self.repo.update_assignment(
-                    asgn_id,
-                    status="failed",
-                    turns_used=usage_now.turns_used,
-                    credits_used=usage_now.credits_used,
-                    ended_at=utc_now_iso(),
-                )
-                self.repo.increment_thread_usage(
-                    thread_id,
-                    credits_delta=usage_now.credits_used,
-                    turns_delta=usage_now.turns_used,
-                )
+                self._finish_usage(asgn_id, thread_id, "failed", usage_now)
                 self.repo.update_ticket(ticket_id, status="failed")
                 self.events.emit(
                     thread_id,
@@ -462,18 +488,7 @@ class WorkerManager:
             raise
         except Exception as exc:
             usage_now = adapter.usage_metrics()
-            self.repo.update_assignment(
-                asgn_id,
-                status="failed",
-                turns_used=usage_now.turns_used,
-                credits_used=usage_now.credits_used,
-                ended_at=utc_now_iso(),
-            )
-            self.repo.increment_thread_usage(
-                thread_id,
-                credits_delta=usage_now.credits_used,
-                turns_delta=usage_now.turns_used,
-            )
+            self._finish_usage(asgn_id, thread_id, "failed", usage_now)
             self.repo.update_ticket(ticket_id, status="failed")
             self.events.emit(
                 thread_id,
@@ -499,18 +514,7 @@ class WorkerManager:
         result_sha = git_sha or committed_sha
 
         if usage_final.aborted:
-            self.repo.update_assignment(
-                asgn_id,
-                status="failed",
-                turns_used=usage_final.turns_used,
-                credits_used=usage_final.credits_used,
-                ended_at=utc_now_iso(),
-            )
-            self.repo.increment_thread_usage(
-                thread_id,
-                credits_delta=usage_final.credits_used,
-                turns_delta=usage_final.turns_used,
-            )
+            self._finish_usage(asgn_id, thread_id, "failed", usage_final)
             self.repo.update_ticket(ticket_id, status="failed")
             self.events.emit(
                 thread_id,
@@ -527,25 +531,13 @@ class WorkerManager:
             )
             raise WorkerExecutionError("Worker execution aborted before completion")
 
-        self.repo.update_assignment(
-            asgn_id,
-            status="completed",
-            result_sha=result_sha,
-            turns_used=usage_final.turns_used,
-            credits_used=usage_final.credits_used,
-            ended_at=utc_now_iso(),
-        )
+        self._finish_usage(asgn_id, thread_id, "completed", usage_final, result_sha)
         self.repo.update_ticket(
             ticket_id,
             status="done",
             worktree_branch=worktree.branch,
             worktree_path=str(worktree.path),
             result_sha=result_sha,
-        )
-        self.repo.increment_thread_usage(
-            thread_id,
-            credits_delta=usage_final.credits_used,
-            turns_delta=usage_final.turns_used,
         )
         self.events.emit(
             thread_id,

@@ -179,6 +179,7 @@ class MockWorkerAdapter(BaseWorkerAdapter):
             "quota_exceeded",
             "slow_for_abort",
             "secret_leak",
+            "readonly_review",
         ] = "commit_success",
         target_path: str = ".thread/policy.yaml",
         shell_command: str = "pytest && rm -rf /",
@@ -327,6 +328,16 @@ class MockWorkerAdapter(BaseWorkerAdapter):
                 "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----",
             )
             yield self._redact_event("session_idle", "Completed secret leak simulation")
+            return
+
+        if self.scenario == "readonly_review":
+            if not self._policy.readonly:
+                raise WorkerExecutionError("Mock reviewer requires a read-only role")
+            self._usage.turns_used += 1
+            self._usage.credits_used += self.credits_per_turn
+            self._check_caps(assignment, self._usage)
+            yield self._redact_event("assistant_message", '{"findings":[]}')
+            yield self._redact_event("session_idle", "Completed mock review protocol")
             return
 
         if self.scenario in ("commit_success", "crash_after_commit"):
