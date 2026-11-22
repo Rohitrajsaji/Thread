@@ -1,0 +1,7 @@
+rules:
+  BR-INV-01:
+    description: Concurrent reservations respect available stock.
+    test_nodeids: [tests/acceptance/test_reservations.py::test_last_unit_race]
+  BR-INV-02:
+    description: Expired reservations release stock.
+    test_nodeids: [tests/acceptance/test_reservations.py::test_reservation_expiry]

@@ -1,0 +1,104 @@
+openapi: 3.1.0
+info:
+  title: Inventory reservations
+  version: '1.0'
+paths:
+  /inventory/reservations:
+    post:
+      summary: Reserve
+      operationId: reserve_inventory_reservations_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReservationRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '404':
+          description: Unknown SKU
+        '409':
+          description: Insufficient stock
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /inventory/reservations/{identifier}:
+    delete:
+      summary: Release
+      operationId: release_inventory_reservations__identifier__delete
+      parameters:
+      - name: identifier
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Identifier
+      responses:
+        '204':
+          description: Successful Response
+        '404':
+          description: Reservation not found
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+components:
+  schemas:
+    HTTPValidationError:
+      properties:
+        detail:
+          items:
+            $ref: '#/components/schemas/ValidationError'
+          type: array
+          title: Detail
+      type: object
+      title: HTTPValidationError
+    ReservationRequest:
+      properties:
+        sku:
+          type: string
+          title: Sku
+        quantity:
+          type: integer
+          exclusiveMinimum: 0.0
+          title: Quantity
+      type: object
+      required:
+      - sku
+      - quantity
+      title: ReservationRequest
+    ValidationError:
+      properties:
+        loc:
+          items:
+            anyOf:
+            - type: string
+            - type: integer
+          type: array
+          title: Location
+        msg:
+          type: string
+          title: Message
+        type:
+          type: string
+          title: Error Type
+        input:
+          title: Input
+        ctx:
+          type: object
+          title: Context
+      type: object
+      required:
+      - loc
+      - msg
+      - type
+      title: ValidationError

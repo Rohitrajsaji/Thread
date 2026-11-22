@@ -1,0 +1,29 @@
+base_branch: main
+tracks:
+  track_1:
+    max_files: 3
+    required_gates: []
+  track_2:
+    max_files: null
+    required_gates:
+    - plan
+    - diff
+  track_3:
+    max_files: null
+    required_gates:
+    - spec
+    - plan
+    - diff
+protected_paths:
+- .thread/policy.yaml
+- .thread/scope.yaml
+- .thread/rules-map.yaml
+- .github/workflows/**
+- tests/acceptance/**
+- db/migrations/**
+- contracts/openapi.yaml
+caps:
+  max_workers_per_thread: 1
+  max_retries_per_ticket: 3
+  max_turns_per_assignment: 30
+  max_credits_per_thread: 500.0

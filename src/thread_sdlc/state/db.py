@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 _SCHEMA_SQL = """
@@ -148,6 +149,7 @@ class StateDatabase:
         if repo_root is None and db_path.parent.name == ".thread-state":
             repo_root = db_path.parent.parent
 
+        self._active: ContextVar[sqlite3.Connection | None] = ContextVar("thread_transaction", default=None)
         self.db_path = db_path.resolve()
         self.repo_root = repo_root.resolve() if repo_root is not None else None
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -178,7 +180,12 @@ class StateDatabase:
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         """Run a write transaction serialized with ``BEGIN IMMEDIATE``."""
+        active = self._active.get()
+        if active is not None:
+            yield active
+            return
         conn = self.connect()
+        token = self._active.set(conn)
         try:
             conn.execute("BEGIN IMMEDIATE;")
             yield conn
@@ -192,11 +199,16 @@ class StateDatabase:
                     pass
             raise
         finally:
+            self._active.reset(token)
             conn.close()
 
     @contextmanager
     def read_connection(self) -> Iterator[sqlite3.Connection]:
-        """Open a read-only style connection context and close cleanly on exit."""
+        """Share the write snapshot inside a transaction."""
+        active = self._active.get()
+        if active is not None:
+            yield active
+            return
         conn = self.connect()
         try:
             yield conn

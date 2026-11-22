@@ -1,0 +1,66 @@
+roles:
+  backend:
+    allowed_paths:
+    - app/**
+    - db/migrations/**
+    - contracts/openapi.yaml
+    - tests/**
+    denied_paths:
+    - .thread/policy.yaml
+    - .thread/scope.yaml
+    - .thread/rules-map.yaml
+    - .github/workflows/**
+    allowed_shell_prefixes:
+    - pytest
+    - python
+    - ruff
+    - git status
+    - git diff
+    readonly: false
+  frontend:
+    allowed_paths:
+    - frontend/**
+    - web/**
+    - tests/**
+    denied_paths:
+    - .thread/policy.yaml
+    - .thread/scope.yaml
+    - .thread/rules-map.yaml
+    - .github/workflows/**
+    allowed_shell_prefixes:
+    - npm test
+    - npm run build
+    - npm run lint
+    - git status
+    - git diff
+    readonly: false
+  verifier:
+    allowed_paths:
+    - tests/**
+    denied_paths:
+    - .thread/policy.yaml
+    - .thread/scope.yaml
+    - .thread/rules-map.yaml
+    - .github/workflows/**
+    allowed_shell_prefixes:
+    - pytest
+    - python -m pytest
+    - git status
+    - git diff
+    readonly: false
+  reviewer_readonly:
+    allowed_paths: []
+    denied_paths:
+    - '**'
+    allowed_shell_prefixes:
+    - git status
+    - git diff
+    - git log
+    - git show
+    readonly: true
+deny_gate_files:
+- .thread/policy.yaml
+- .thread/scope.yaml
+- .thread/rules-map.yaml
+- .github/workflows/**
+- tests/acceptance/**

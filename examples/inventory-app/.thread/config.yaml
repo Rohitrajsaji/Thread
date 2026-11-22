@@ -1,0 +1,11 @@
+project_name: inventory-app
+base_branch: main
+adapter: auto
+ui_port: 4242
+commands:
+  test: python -m pytest -q
+  lint: null
+  build: null
+enabled_milestones:
+- M0
+- M1

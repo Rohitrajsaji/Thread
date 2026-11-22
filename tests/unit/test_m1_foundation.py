@@ -4523,7 +4523,7 @@ def test_git_exec_path_git_dir_worktree_write_scope_and_readonly_mutations(tmp_p
     assert be.enforce_shell("git -C app checkout -- ok.py")
     assert be.enforce_shell("git -C app status")
     assert be.enforce_shell("git init app/subrepo")
-    assert be.enforce_shell("git --git-dir=app/subrepo/.git init app/subrepo")
+    assert be.enforce_shell("git --git-dir=.git init app/subrepo")
     assert be.enforce_shell("git clone app app/dst")
     assert be.enforce_shell("git checkout -- app/ok.py")
 

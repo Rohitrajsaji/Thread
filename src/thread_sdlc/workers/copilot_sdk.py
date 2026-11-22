@@ -25,6 +25,7 @@ from thread_sdlc.workers.adapter import (
     is_quota_error,
 )
 from thread_sdlc.workers.permissions import (
+    _PATH_ARG_KEYS,
     _SHELL_CWD_KEYS,
     _SHELL_TOOLS,
     _WRITE_TOOLS,
@@ -382,50 +383,53 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
                         )
 
             if kind == "write":
-                targets: list[str] = []
-                for attr in ("file_name", "fileName", "resolved_path", "resolvedPath", "path"):
-                    val = _extract_attr_or_key(request, attr)
-                    if isinstance(val, str) and val.strip():
-                        targets.append(val.strip())
-                edits = _extract_attr_or_key(request, "file_edits", "fileEdits")
-                if isinstance(edits, (list, tuple)):
-                    for ed in edits:
-                        fn = _extract_attr_or_key(ed, "file_name", "fileName", "path")
-                        if isinstance(fn, str) and fn.strip():
-                            targets.append(fn.strip())
-                        for side_name in ("after", "before"):
-                            side = _extract_attr_or_key(ed, side_name)
-                            if side is not None:
-                                side_path = _extract_attr_or_key(
-                                    side, "path", "file_name", "fileName"
-                                )
-                                if not isinstance(side_path, str) or not side_path.strip():
-                                    raise ScopeViolationError(
-                                        self._policy.role,
-                                        "write",
-                                        "<unknown>",
-                                        "Write permission request file_edits entry missing target path (fail closed)",
-                                    )
-                                targets.append(side_path.strip())
-                new_contents = _extract_attr_or_key(
-                    request, "new_file_contents", "newFileContents"
-                )
-                if new_contents is not None and not isinstance(new_contents, str):
-                    items = (
-                        list(new_contents)
-                        if isinstance(new_contents, (list, tuple))
-                        else [new_contents]
-                    )
-                    for item in items:
-                        item_path = _extract_attr_or_key(item, "path", "file_name", "fileName")
-                        if not isinstance(item_path, str) or not item_path.strip():
+                def paths_in(obj: Any) -> list[str]:
+                    paths = []
+                    for key in _PATH_ARG_KEYS:
+                        val = _extract_attr_or_key(obj, key)
+                        if val is None:
+                            continue
+                        if not isinstance(val, str) or not val.strip():
                             raise ScopeViolationError(
-                                self._policy.role,
-                                "write",
-                                "<unknown>",
-                                "Write permission request new_file_contents item missing target path (fail closed)",
+                                self._policy.role, "write", key, "Invalid write target path"
                             )
-                        targets.append(item_path.strip())
+                        paths.append(val.strip())
+                    return paths
+
+                targets = paths_in(request)
+                edits = _extract_attr_or_key(request, "file_edits", "fileEdits")
+                if edits is not None:
+                    if not isinstance(edits, (list, tuple)):
+                        raise ScopeViolationError(
+                            self._policy.role, "write", "file_edits", "Expected an edit list"
+                        )
+                    for edit in edits:
+                        edit_targets = paths_in(edit)
+                        for side_name in ("after", "before"):
+                            side = _extract_attr_or_key(edit, side_name)
+                            if side is not None:
+                                side_paths = paths_in(side)
+                                if not side_paths:
+                                    raise ScopeViolationError(
+                                        self._policy.role, "write", side_name, "Edit side missing target path"
+                                    )
+                                edit_targets.extend(side_paths)
+                        if not edit_targets:
+                            raise ScopeViolationError(
+                                self._policy.role, "write", "file_edits", "Edit missing target path"
+                            )
+                        targets.extend(edit_targets)
+
+                new_contents = _extract_attr_or_key(request, "new_file_contents", "newFileContents")
+                if new_contents is not None and not isinstance(new_contents, str):
+                    items = new_contents if isinstance(new_contents, (list, tuple)) else [new_contents]
+                    for item in items:
+                        item_paths = paths_in(item)
+                        if not item_paths:
+                            raise ScopeViolationError(
+                                self._policy.role, "write", "new_file_contents", "Missing target path"
+                            )
+                        targets.extend(item_paths)
                 if not targets:
                     raise ScopeViolationError(
                         self._policy.role,

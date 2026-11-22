@@ -12,7 +12,7 @@ import sys
 import tomllib
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal
+from typing import Any, Literal, NoReturn
 from urllib.parse import urlsplit
 from urllib.request import url2pathname
 
@@ -91,8 +91,6 @@ _READ_TOOLS = frozenset(
 
 _ALWAYS_PROTECTED_PREFIXES = (".git", ".thread-state")
 
-_FORBIDDEN_GIT_SUBCOMMANDS = frozenset({"merge", "push", "rebase", "worktree", "cherry-pick"})
-
 _READONLY_MUTATING_CMDS = frozenset(
     {
         "rm",
@@ -112,43 +110,16 @@ _READONLY_MUTATING_CMDS = frozenset(
     }
 )
 
-_READONLY_MUTATING_GIT_SUBCOMMANDS = frozenset(
-    {
-        "add",
-        "commit",
-        "checkout",
-        "switch",
-        "reset",
-        "clean",
-        "restore",
-        "merge",
-        "rebase",
-        "cherry-pick",
-        "push",
-        "pull",
-        "fetch",
-        "branch",
-        "tag",
-        "worktree",
-        "stash",
-        "am",
-        "apply",
-        "rm",
-        "mv",
-        "config",
-        "init",
-        "clone",
-        "gc",
-        "remote",
-        "submodule",
-        "notes",
-        "replace",
-        "bisect",
-        "repack",
-        "prune",
-        "revert",
-    }
-)
+# Reviewed command forms. Git helpers and commands with repository-wide side
+# effects require a separate policy; they cannot inherit a broad "git" prefix.
+_GIT_INSPECTION_OPTIONS = {
+    "status": {"--short", "-s", "--branch", "-b", "--porcelain", "--porcelain=v1", "--porcelain=v2", "--ignored"},
+    "diff": {"--stat", "--name-only", "--name-status", "--cached", "--staged", "--check", "--summary", "--numstat", "--no-color", "--no-ext-diff", "--no-textconv", "-w", "-U0"},
+    "log": {"--oneline", "--stat", "--name-only", "--graph", "--decorate", "--no-decorate", "--all", "--no-color"},
+    "show": {"--oneline", "--stat", "--name-only", "--no-color", "--no-ext-diff", "--no-textconv"},
+    "ls-files": {"--cached", "--modified", "--deleted", "--others", "--exclude-standard", "-z"},
+    "rev-parse": {"--short", "--verify", "--abbrev-ref", "--show-toplevel", "--is-inside-work-tree"},
+}
 
 _PATH_ARG_KEYS = (
     "path",
@@ -1018,6 +989,136 @@ class RolePolicy:
             lexical_cwds=lexical_cwds,
         )
 
+    def _validate_git(self, args: list[str], command: str, cwd: Path) -> None:
+        """Approve only understood Git operations with explicit operands."""
+
+        def reject(reason: str) -> NoReturn:
+            raise ScopeViolationError(self.role, "shell", command, reason)
+
+        def literal(value: str) -> str:
+            if (
+                not value
+                or value != value.strip()
+                or value.startswith(("-", "~"))
+                or not re.fullmatch(r"[\w./ @+~-]+", value)
+            ):
+                reject("Git requires literal file or revision operands")
+            return value
+
+        def check_path_identity(value: str, base_dir: Path, resolved: Path) -> None:
+            # Git pathspecs address the named index entry. Following a symlink
+            # to a different file would authorize the wrong entry.
+            if Path(os.path.normpath(base_dir / value)) != resolved:
+                reject("Git path must identify the same lexical and resolved location")
+
+        def writable(value: str, *, directory: bool = False) -> Path:
+            literal(value)
+            path = self.enforce_write(value, base_dir=cwd)
+            check_path_identity(value, cwd, path)
+            rel = path.relative_to(self.worktree_root)
+            if any(
+                _pattern_can_match_under_dir(rel.parts, _normalize_pattern(pattern))
+                for pattern in (*self.denied_paths, *self.deny_gate_files)
+            ):
+                reject("Git target contains paths excluded by role policy")
+            if directory or path.is_dir() or not path.exists():
+                # An absent path can still represent a tracked directory. It is
+                # safe only when all possible children belong to the role.
+                if not any(
+                    _normalize_pattern(pattern)[-1:] == ["**"]
+                    and glob_match(rel.as_posix(), pattern)
+                    for pattern in self.allowed_paths
+                ):
+                    reject("Git directory scope requires an allowlist covering the entire subtree")
+            return path
+
+        git_dir: str | None = None
+        while args and args[0].startswith("-"):
+            opt, *args = args
+            if opt in {"--no-pager", "--no-optional-locks", "--literal-pathspecs"}:
+                continue
+            if opt.startswith("--git-dir="):
+                opt, val = opt.split("=", 1)
+            elif opt in {"-C", "-c", "--git-dir"} and args:
+                val, *args = args
+            else:
+                reject("Unsupported Git global option")
+            if opt == "-C":
+                if git_dir is not None:
+                    reject("Git directory must follow working directory selection")
+                selected_cwd = self.enforce_read(literal(val), base_dir=cwd)
+                check_path_identity(val, cwd, selected_cwd)
+                if not selected_cwd.is_dir():
+                    reject("Git working directory must exist")
+                cwd = selected_cwd
+            elif opt == "--git-dir":
+                if git_dir is not None:
+                    reject("Git directory may only be specified once")
+                git_dir = literal(val)
+            else:
+                key, separator, value = val.partition("=")
+                if (
+                    self.readonly or not separator or value.lstrip().startswith("!")
+                    or key.lower() not in {"user.name", "user.email"}
+                ):
+                    reject("Unsupported Git configuration override")
+
+        if not args:
+            reject("Missing Git operation")
+        op, *rest = args
+        if op in _GIT_INSPECTION_OPTIONS:
+            if git_dir is not None:
+                metadata = self.enforce_read(git_dir, base_dir=cwd)
+                check_path_identity(git_dir, cwd, metadata)
+                if metadata != self.worktree_root / ".git":
+                    reject("Git inspection requires the current repository metadata")
+            after_separator = False
+            for arg in rest:
+                if arg == "--" and not after_separator:
+                    after_separator = True
+                elif not after_separator and (
+                    arg in _GIT_INSPECTION_OPTIONS[op]
+                    or (op in {"log", "show"} and re.fullmatch(r"-\d+|--max-count=\d+", arg))
+                ):
+                    continue
+                else:
+                    self.enforce_read(literal(arg), base_dir=cwd)
+            return
+        if self.readonly:
+            reject("Only read-only Git inspection is available to this role")
+        if git_dir is not None and op != "init":
+            reject("Explicit Git metadata directory unsupported for this operation")
+        if op == "init" and len(rest) == 1:
+            destination = writable(rest[0], directory=True)
+            # Git enters the destination before interpreting a relative
+            # metadata directory. A .git file can redirect metadata elsewhere.
+            metadata_operand = git_dir or ".git"
+            metadata = self.enforce_read(metadata_operand, base_dir=destination)
+            check_path_identity(metadata_operand, destination, metadata)
+            if metadata != destination / ".git" or metadata.is_file():
+                reject("Git metadata must reside inside the initialized directory")
+            return
+        if op == "clone":
+            if len(rest) != 2 or any(value.startswith("-") for value in rest):
+                reject("Git clone requires a local source and an explicit destination without options")
+            source, destination = rest
+            self.enforce_read(literal(source), base_dir=cwd)
+            writable(destination, directory=True)
+            return
+        if op not in {"add", "restore", "checkout", "mv", "rm"}:
+            reject("Git operation has no worker permission policy")
+        if op == "checkout" and rest[:1] != ["--"]:
+            reject("Git checkout requires an explicit path separator")
+        safe_flags = {"rm": {"-f", "--cached"}, "mv": {"-f"}, "restore": {"--staged", "--worktree"}}
+        while rest and rest[0] in safe_flags.get(op, ()):
+            rest = rest[1:]
+        if rest[:1] == ["--"]:
+            rest = rest[1:]
+        if not rest or (op == "mv" and len(rest) < 2):
+            reject("Git operation requires explicit file operands")
+        for value in rest:
+            writable(value)
+
     def _validate_shell_tokens(
         self,
         tokens: list[str],
@@ -1036,446 +1137,8 @@ class RolePolicy:
         exe = Path(tokens[0]).name
         exe_lower = exe.lower()
 
-        # Prevent git merge / push / rebase / worktree and external repo flags
         if exe_lower == "git":
-            _dangerous_git_config_keys = frozenset(
-                {
-                    "core.fsmonitor",
-                    "core.hookspath",
-                    "core.sshcommand",
-                    "core.gitproxy",
-                    "core.pager",
-                    "core.editor",
-                    "core.askpass",
-                    "core.attributesfile",
-                    "core.excludesfile",
-                    "core.alternaterefscommand",
-                    "diff.external",
-                    "diff.tool",
-                    "merge.tool",
-                    "credential.helper",
-                    "uploadpack.packobjectshook",
-                    "gpg.program",
-                    "gpg.ssh.program",
-                    "sequence.editor",
-                    "web.browser",
-                    "safe.directory",
-                    "init.templatedir",
-                    "protocol.ext.allow",
-                    "protocol.file.allow",
-                    "protocol.allow",
-                }
-            )
-            _dangerous_git_config_prefixes = (
-                "alias.",
-                "filter.",
-                "pager.",
-                "remote.",
-                "url.",
-                "include.",
-                "includeif.",
-                "credential.",
-                "difftool.",
-                "mergetool.",
-                "browser.",
-            )
-            subcmd: str | None = None
-            subcmd_idx: int | None = None
-            expect_global_opt: str | None = None
-            expect_git_output = False
-            git_cwd = effective_cwd
-            git_target_dirs: list[Path] = []
-            git_dir_targets: list[Path] = []
-
-            def _validate_git_config_override(
-                cfg_spec: str, *, is_config_env: bool = False
-            ) -> None:
-                if self.readonly:
-                    raise ScopeViolationError(
-                        self.role,
-                        "shell",
-                        command,
-                        "Read-only role cannot use git config override '-c'/'--config-env'",
-                    )
-                if not cfg_spec.strip():
-                    raise ScopeViolationError(
-                        self.role,
-                        "shell",
-                        command,
-                        "Empty git config override (fail closed)",
-                    )
-                cfg_key, has_eq, cfg_val = cfg_spec.partition("=")
-                key_lower = cfg_key.strip().lower()
-                if not key_lower:
-                    raise ScopeViolationError(
-                        self.role,
-                        "shell",
-                        command,
-                        f"Malformed git config override {cfg_spec!r}",
-                    )
-                if key_lower in _dangerous_git_config_keys or key_lower.startswith(
-                    _dangerous_git_config_prefixes
-                ):
-                    raise ScopeViolationError(
-                        self.role,
-                        "shell",
-                        command,
-                        f"Dangerous git config override {cfg_key!r} is disallowed",
-                    )
-                if not is_config_env and has_eq and cfg_val.lstrip().startswith("!"):
-                    raise ScopeViolationError(
-                        self.role,
-                        "shell",
-                        command,
-                        f"Git config override {cfg_key!r} with '!' command execution is disallowed",
-                    )
-
-            for i, tok in enumerate(tokens[1:], start=1):
-                if expect_git_output:
-                    expect_git_output = False
-                    if self.readonly:
-                        raise ScopeViolationError(
-                            self.role,
-                            "shell",
-                            command,
-                            "Read-only role cannot use file-writing git flag '--output'",
-                        )
-                    self.enforce_write(tok, base_dir=git_cwd)
-                    continue
-
-                if tok in ("--upload-pack", "--receive-pack") or tok.startswith(
-                    ("--upload-pack=", "--receive-pack=")
-                ):
-                    raise ScopeViolationError(
-                        self.role,
-                        "shell",
-                        command,
-                        f"Git option {tok.split('=', 1)[0]!r} is disallowed by Thread role policy",
-                    )
-
-                if subcmd is None:
-                    if expect_global_opt is not None:
-                        opt_used = expect_global_opt
-                        expect_global_opt = None
-                        if opt_used == "-C":
-                            git_cwd = self.enforce_read(tok, base_dir=git_cwd)
-                            git_target_dirs.append(git_cwd)
-                        elif opt_used == "--git-dir":
-                            gd_dir = self.enforce_read(tok, base_dir=effective_cwd)
-                            git_dir_targets.append(gd_dir)
-                        elif opt_used == "--work-tree":
-                            wt_dir = self.enforce_read(tok, base_dir=effective_cwd)
-                            git_target_dirs.append(wt_dir)
-                        elif opt_used == "-c":
-                            _validate_git_config_override(tok)
-                        elif opt_used == "--config-env":
-                            _validate_git_config_override(tok, is_config_env=True)
-                        # --namespace, --super-prefix, --attr-source take a value and are skipped
-                        continue
-
-                    if tok == "--exec-path" or tok.startswith("--exec-path="):
-                        raise ScopeViolationError(
-                            self.role,
-                            "shell",
-                            command,
-                            "Git '--exec-path' option is disallowed by Thread role policy",
-                        )
-
-                    if tok == "--":
-                        break
-                    if tok == "-C":
-                        expect_global_opt = "-C"
-                        continue
-                    if tok.startswith("-C") and len(tok) > 2:
-                        git_cwd = self.enforce_read(tok[2:], base_dir=git_cwd)
-                        git_target_dirs.append(git_cwd)
-                        continue
-                    if tok == "-c":
-                        expect_global_opt = "-c"
-                        continue
-                    if tok.startswith("-c") and len(tok) > 2:
-                        _validate_git_config_override(tok[2:])
-                        continue
-                    if tok in (
-                        "--git-dir",
-                        "--work-tree",
-                        "--namespace",
-                        "--super-prefix",
-                        "--config-env",
-                        "--attr-source",
-                    ):
-                        expect_global_opt = tok
-                        continue
-                    if tok.startswith("--git-dir="):
-                        _, val = tok.split("=", 1)
-                        gd_dir = self.enforce_read(val, base_dir=effective_cwd)
-                        git_dir_targets.append(gd_dir)
-                        continue
-                    if tok.startswith("--work-tree="):
-                        _, val = tok.split("=", 1)
-                        wt_dir = self.enforce_read(val, base_dir=effective_cwd)
-                        git_target_dirs.append(wt_dir)
-                        continue
-                    if tok.startswith("--config-env="):
-                        _, val = tok.split("=", 1)
-                        _validate_git_config_override(val, is_config_env=True)
-                        continue
-                    if tok.startswith(
-                        (
-                            "--namespace=",
-                            "--super-prefix=",
-                            "--attr-source=",
-                            "--list-cmds=",
-                        )
-                    ):
-                        continue
-                    if not tok.startswith("-"):
-                        subcmd = tok
-                        subcmd_idx = i
-                        continue
-
-                if tok == "--output":
-                    if self.readonly:
-                        raise ScopeViolationError(
-                            self.role,
-                            "shell",
-                            command,
-                            "Read-only role cannot use file-writing git flag '--output'",
-                        )
-                    if i + 1 >= len(tokens):
-                        raise ScopeViolationError(
-                            self.role, "shell", command, "Missing target path for '--output'"
-                        )
-                    expect_git_output = True
-                elif tok.startswith("--output="):
-                    if self.readonly:
-                        raise ScopeViolationError(
-                            self.role,
-                            "shell",
-                            command,
-                            "Read-only role cannot use file-writing git flag '--output'",
-                        )
-                    _, out_val = tok.split("=", 1)
-                    self.enforce_write(out_val, base_dir=git_cwd)
-                elif tok == "--ext-diff" or tok.startswith("--ext-diff="):
-                    if self.readonly:
-                        raise ScopeViolationError(
-                            self.role,
-                            "shell",
-                            command,
-                            "Read-only role cannot use git '--ext-diff' flag",
-                        )
-
-            if expect_global_opt is not None:
-                raise ScopeViolationError(
-                    self.role,
-                    "shell",
-                    command,
-                    f"Missing value for git global option {expect_global_opt!r}",
-                )
-
-            subcmd_lower = subcmd.lower() if subcmd is not None else None
-            if subcmd_lower in _FORBIDDEN_GIT_SUBCOMMANDS:
-                raise ScopeViolationError(
-                    self.role,
-                    "shell",
-                    command,
-                    f"Git subcommand 'git {subcmd}' is forbidden for workers",
-                )
-            if self.readonly and subcmd_lower in _READONLY_MUTATING_GIT_SUBCOMMANDS:
-                raise ScopeViolationError(
-                    self.role,
-                    "shell",
-                    command,
-                    f"Read-only role cannot execute mutating git command 'git {subcmd}'",
-                )
-            if subcmd_lower in _READONLY_MUTATING_GIT_SUBCOMMANDS:
-                def _enforce_git_write_dir(target_dir: Path, *, allow_root: bool = False) -> None:
-                    rel_dir = target_dir.relative_to(self.worktree_root).as_posix()
-                    if rel_dir == ".":
-                        if allow_root:
-                            return
-                        raise ScopeViolationError(
-                            self.role,
-                            "shell",
-                            command,
-                            f"Mutating git command 'git {subcmd}' targets worktree root '.' outside allowed_paths",
-                        )
-                    first_part = PurePosixPath(rel_dir).parts[0]
-                    if first_part in _ALWAYS_PROTECTED_PREFIXES:
-                        raise ScopeViolationError(
-                            self.role,
-                            "shell",
-                            command,
-                            f"Mutating git command 'git {subcmd}' targets protected directory {first_part!r}",
-                        )
-                    if any(
-                        glob_match(rel_dir, pat)
-                        for pat in (*self.denied_paths, *self.deny_gate_files)
-                    ):
-                        raise ScopeViolationError(
-                            self.role,
-                            "shell",
-                            command,
-                            f"Mutating git command 'git {subcmd}' targets denied directory {rel_dir!r}",
-                        )
-                    if not self.allowed_paths:
-                        raise ScopeViolationError(
-                            self.role,
-                            "shell",
-                            command,
-                            f"Mutating git command 'git {subcmd}' has no allowed_paths configured",
-                        )
-                    dir_parts = tuple(
-                        p for p in PurePosixPath(rel_dir).parts if p not in ("", ".")
-                    )
-                    if not any(
-                        glob_match(rel_dir, pat)
-                        or _pattern_can_match_under_dir(dir_parts, _normalize_pattern(pat))
-                        for pat in self.allowed_paths
-                    ):
-                        raise ScopeViolationError(
-                            self.role,
-                            "shell",
-                            command,
-                            f"Mutating git command 'git {subcmd}' targets directory {rel_dir!r} outside allowed_paths {self.allowed_paths}",
-                        )
-
-                for gd in git_dir_targets:
-                    _enforce_git_write_dir(gd, allow_root=False)
-                for gdir in git_target_dirs:
-                    _enforce_git_write_dir(gdir, allow_root=True)
-                if git_cwd != self.worktree_root:
-                    _enforce_git_write_dir(git_cwd, allow_root=True)
-
-                sub_tokens = tokens[subcmd_idx + 1 :] if subcmd_idx is not None else []
-                if subcmd_lower in ("init", "clone"):
-                    value_flags = (
-                        {
-                            "--template",
-                            "--separate-git-dir",
-                            "--shared",
-                            "-b",
-                            "--initial-branch",
-                            "--object-format",
-                            "--ref-format",
-                        }
-                        if subcmd_lower == "init"
-                        else {
-                            "-o",
-                            "--origin",
-                            "-b",
-                            "--branch",
-                            "-u",
-                            "--upload-pack",
-                            "--reference",
-                            "--reference-if-able",
-                            "--separate-git-dir",
-                            "--depth",
-                            "--shallow-since",
-                            "--shallow-exclude",
-                            "-c",
-                            "--config",
-                            "-j",
-                            "--jobs",
-                            "--template",
-                            "--filter",
-                            "--bundle-uri",
-                            "--server-option",
-                        }
-                    )
-                    expect_sub_val: str | None = None
-                    after_dd = False
-                    has_separate_gd = False
-                    pos_args: list[str] = []
-                    for st in sub_tokens:
-                        if expect_sub_val is not None:
-                            opt_name = expect_sub_val
-                            expect_sub_val = None
-                            if opt_name == "--separate-git-dir":
-                                has_separate_gd = True
-                                sep_gd = self.enforce_read(st, base_dir=git_cwd)
-                                _enforce_git_write_dir(sep_gd, allow_root=False)
-                            continue
-                        if after_dd:
-                            pos_args.append(st)
-                            continue
-                        if st == "--":
-                            after_dd = True
-                            continue
-                        if st in value_flags:
-                            if subcmd_lower == "clone" and (st == "-u" or st == "--upload-pack"):
-                                raise ScopeViolationError(
-                                    self.role,
-                                    "shell",
-                                    command,
-                                    f"Git clone option {st!r} is disallowed by Thread role policy",
-                                )
-                            expect_sub_val = st
-                            continue
-                        if subcmd_lower == "clone" and st.startswith("-u") and not st.startswith("--"):
-                            raise ScopeViolationError(
-                                self.role,
-                                "shell",
-                                command,
-                                "Git clone '-u' option is disallowed by Thread role policy",
-                            )
-                        if st.startswith("--separate-git-dir="):
-                            has_separate_gd = True
-                            _, sep_val = st.split("=", 1)
-                            sep_gd = self.enforce_read(sep_val, base_dir=git_cwd)
-                            _enforce_git_write_dir(sep_gd, allow_root=False)
-                            continue
-                        if st.startswith("-"):
-                            continue
-                        pos_args.append(st)
-                    if expect_sub_val is not None:
-                        raise ScopeViolationError(
-                            self.role,
-                            "shell",
-                            command,
-                            f"Missing value for git {subcmd_lower} option {expect_sub_val!r}",
-                        )
-                    if subcmd_lower == "init":
-                        if pos_args:
-                            init_dir = self.enforce_read(pos_args[0], base_dir=git_cwd)
-                            _enforce_git_write_dir(init_dir, allow_root=False)
-                        elif not git_dir_targets and not has_separate_gd:
-                            _enforce_git_write_dir(git_cwd / ".git", allow_root=False)
-                    else:  # clone
-                        if len(pos_args) >= 2:
-                            clone_dir = self.enforce_read(pos_args[1], base_dir=git_cwd)
-                            _enforce_git_write_dir(clone_dir, allow_root=False)
-                        elif len(pos_args) == 1:
-                            repo_spec = pos_args[0].rstrip("/\\")
-                            tail = repo_spec.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-                            if tail.endswith(".git"):
-                                tail = tail[:-4]
-                            derived = tail or "repo"
-                            clone_dir = self.enforce_read(derived, base_dir=git_cwd)
-                            _enforce_git_write_dir(clone_dir, allow_root=False)
-                        else:
-                            raise ScopeViolationError(
-                                self.role,
-                                "shell",
-                                command,
-                                "Missing repository argument for 'git clone'",
-                            )
-                elif subcmd_lower in ("checkout", "restore", "rm", "mv", "add"):
-                    after_dd = False
-                    pathspecs: list[str] = []
-                    for st in sub_tokens:
-                        if after_dd:
-                            pathspecs.append(st)
-                        elif st == "--":
-                            after_dd = True
-                        elif subcmd_lower in ("rm", "mv") and not st.startswith("-"):
-                            pathspecs.append(st)
-                    for ps in pathspecs:
-                        if ps == ".":
-                            _enforce_git_write_dir(git_cwd, allow_root=False)
-                        else:
-                            self.enforce_write(ps, base_dir=git_cwd)
+            self._validate_git(tokens[1:], command, effective_cwd)
 
         # Restrict inline code execution flags and `-m <module>` for python across all roles
         python_module: str | None = None
@@ -3112,6 +2775,11 @@ class RolePolicy:
                     )
                 self.enforce_shell(raw_val, cwd=non_shell_cwd)
 
+            else:
+                raise ScopeViolationError(
+                    self.role, "tool", tool_name, "Shell-like tool call missing command argument"
+                )
+
         is_write_routed = norm_name in _WRITE_TOOLS or (
             norm_name not in _READ_TOOLS
             and any(
@@ -3165,18 +2833,6 @@ class RolePolicy:
                 "tool",
                 tool_name,
                 f"Read-only role cannot invoke unrecognized or mutating tool {tool_name!r}",
-            )
-
-        if (
-            is_shell_like
-            and not shell_cmd_values
-            and not isinstance(args.get("raw"), str)
-        ):
-            raise ScopeViolationError(
-                self.role,
-                "tool",
-                tool_name,
-                "Shell-like tool call missing command argument (fail closed)",
             )
 
         # Unrecognized tools carrying path args must be strictly validated.
@@ -3302,7 +2958,7 @@ class RolePolicy:
             )
 
         normalized_args_entries: list[tuple[str, dict[str, Any]]] = []
-        for key in ("toolArgs", "tool_args", "args", "arguments", "input"):
+        for key in ("toolArgs", "tool_args", "args", "arguments", "input", "params", "parameters"):
             present, val = _get_field(key)
             if present and val is not None:
                 normalized_args_entries.append((key, _normalize_args_value(val, key)))
@@ -3329,7 +2985,7 @@ class RolePolicy:
                     break
 
         _payload_skip_keys = frozenset(
-            {"toolName", "tool_name", "toolArgs", "tool_args", "args", "arguments", "input"}
+            {"toolName", "tool_name", "toolArgs", "tool_args", "args", "arguments", "input", "params", "parameters"}
         )
 
         def _payload_obj_to_cwd_tree(
