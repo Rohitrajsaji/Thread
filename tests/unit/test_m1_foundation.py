@@ -4388,3 +4388,237 @@ def test_double_encoded_json_raw_shell_tools_and_sdk_shell_nested_cwd(tmp_path: 
         )
     )
     assert ok_dec["kind"] == "approved"
+
+
+# ---------------------------------------------------------------------------
+# 24. Iteration 14 Regression Tests (R13 Challenger 1 & 2 Findings)
+# ---------------------------------------------------------------------------
+
+
+def test_pytest_double_dash_cacheprovider_reenable_and_bundled_p_denied(tmp_path: Path) -> None:
+    """Verify -p cacheprovider / -pcacheprovider after '--' and bundled -p clusters reset cache disabling."""
+    wt = tmp_path / "wt"
+    (wt / ".thread").mkdir(parents=True)
+    (wt / ".thread" / "policy.yaml").write_text("base_branch: main\n", encoding="utf-8")
+    (wt / "app").mkdir(parents=True)
+    (wt / "tests").mkdir(parents=True)
+    (wt / "tests" / "test_ok.py").write_text("def test_ok(): pass\n", encoding="utf-8")
+
+    ver = RolePolicy(
+        role="verifier",
+        worktree_root=wt,
+        allowed_paths=["tests/**"],
+        denied_paths=[".thread/**"],
+        allowed_shell_prefixes=["pytest", "python"],
+    )
+    ro = RolePolicy(
+        role="reviewer_readonly",
+        worktree_root=wt,
+        allowed_paths=[],
+        denied_paths=["**"],
+        allowed_shell_prefixes=["pytest", "python"],
+        readonly=True,
+    )
+    sdk_ver = CopilotSdkAdapter(ver)
+
+    for bad_cmd in (
+        "pytest -p no:cacheprovider -- -p cacheprovider",
+        "pytest -p no:cacheprovider -- -pcacheprovider",
+        "pytest -p no:cacheprovider -- -p cacheprovider ../tests/test_ok.py",
+        "pytest -p no:cacheprovider -- -qp cacheprovider",
+        "pytest -p no:cacheprovider -- -qpcacheprovider",
+        "pytest -p no:cacheprovider -qp cacheprovider",
+        "pytest -p no:cacheprovider -qpcacheprovider",
+        "python -m pytest -p no:cacheprovider -- -p cacheprovider",
+        "python -m pytest -p no:cacheprovider -- -pcacheprovider",
+    ):
+        for cwd_dir in (".thread", "app"):
+            for pol in (ver, ro):
+                with pytest.raises(ScopeViolationError):
+                    pol.enforce_shell(bad_cmd, cwd=cwd_dir)
+        dec = asyncio.run(
+            sdk_ver._on_pre_tool_use(
+                {"toolName": "bash", "cwd": ".thread", "toolArgs": {"command": bad_cmd}}
+            )
+        )
+        assert dec["permissionDecision"] == "deny"
+
+    # Legitimate standalone -p no:cacheprovider before '--' remains allowed
+    assert ver.enforce_shell("pytest -p no:cacheprovider -- tests/test_ok.py", cwd=".thread")
+    assert ro.enforce_shell("pytest -p no:cacheprovider -- tests/test_ok.py", cwd=".thread")
+    assert ver.enforce_shell("pytest -p no:cacheprovider -- -p no:cacheprovider", cwd=".thread")
+
+
+def test_git_exec_path_git_dir_worktree_write_scope_and_readonly_mutations(tmp_path: Path) -> None:
+    """Verify git --exec-path, --upload-pack, --git-dir/--work-tree/-C write scope, init/clone, and readonly mutations."""
+    wt = tmp_path / "wt"
+    (wt / "app").mkdir(parents=True)
+    (wt / "app" / "ok.py").write_text("x = 1\n", encoding="utf-8")
+    (wt / "tests").mkdir(parents=True)
+    (wt / "tests" / "t.py").write_text("y = 2\n", encoding="utf-8")
+    (wt / ".thread").mkdir(parents=True)
+    (wt / ".thread" / "policy.yaml").write_text("base_branch: main\n", encoding="utf-8")
+    (wt / ".git").mkdir(parents=True)
+    (wt / ".thread-state").mkdir(parents=True)
+
+    be = RolePolicy(
+        role="backend",
+        worktree_root=wt,
+        allowed_paths=["app/**"],
+        denied_paths=[".thread/**"],
+        allowed_shell_prefixes=["git"],
+    )
+    ro = RolePolicy(
+        role="reviewer_readonly",
+        worktree_root=wt,
+        allowed_paths=[],
+        denied_paths=["**"],
+        allowed_shell_prefixes=["git"],
+        readonly=True,
+    )
+
+    # 1. --exec-path / --upload-pack / --receive-pack / clone -u rejected before/after subcmd
+    for exec_bad in (
+        "git --exec-path=.thread/bin pwn",
+        "git --exec-path=app pwn",
+        "git --exec-path status",
+        "git -c user.name=x --exec-path=app pwn",
+        "git --upload-pack=/tmp/evil ls-remote .",
+        "git ls-remote --upload-pack=/tmp/evil .",
+        "git --receive-pack=/tmp/evil send-pack .",
+        "git clone -u /tmp/evil app app/dst",
+    ):
+        for pol in (be, ro):
+            with pytest.raises(ScopeViolationError):
+                pol.enforce_shell(exec_bad)
+            _assert_denied_all_five_gates(pol, wt, {"toolName": "bash", "toolArgs": {"command": exec_bad}})
+
+    # 2. backend mutating git commands outside allowed_paths or into protected/denied dirs
+    for be_bad in (
+        "git --git-dir=.thread/.git init",
+        "git --git-dir .thread/.git init",
+        "git --git-dir=.git init",
+        "git --git-dir=.thread-state init",
+        "git --git-dir=tests/.git init",
+        "git --git-dir=. init",
+        "git init",
+        "git init tests/repo",
+        "git init .thread/repo",
+        "git init --separate-git-dir=.thread/gd app/repo",
+        "git clone app tests/dst",
+        "git clone app/sub.git",
+        "git clone tests/src",
+        "git -C tests checkout -- t.py",
+        "git -C .git reset --hard",
+        "git -C .thread-state reset --hard",
+        "git --work-tree=tests checkout -- t.py",
+        "git checkout -- tests/t.py",
+        "git rm -f tests/t.py",
+        "git mv app/ok.py tests/moved.py",
+    ):
+        with pytest.raises(ScopeViolationError):
+            be.enforce_shell(be_bad)
+
+    # In-scope backend git commands remain allowed
+    assert be.enforce_shell("git -C app checkout -- ok.py")
+    assert be.enforce_shell("git -C app status")
+    assert be.enforce_shell("git init app/subrepo")
+    assert be.enforce_shell("git --git-dir=app/subrepo/.git init app/subrepo")
+    assert be.enforce_shell("git clone app app/dst")
+    assert be.enforce_shell("git checkout -- app/ok.py")
+
+    # 3. reviewer_readonly rejects all newly added mutating subcommands + --git-dir/--work-tree mutations
+    for ro_bad in (
+        "git -C app rm -f ok.py",
+        "git -C app mv ok.py moved.py",
+        "git -C app config user.name evil",
+        "git -C app init",
+        "git -C app clone . dst",
+        "git -C app gc",
+        "git -C app remote add origin https://example.com",
+        "git -C app submodule status",
+        "git -C app notes list",
+        "git -C app replace",
+        "git -C app bisect start",
+        "git -C app repack",
+        "git -C app prune",
+        "git -C app revert HEAD",
+        "git --git-dir=app/.git init",
+        "git --work-tree=app checkout -- ok.py",
+    ):
+        with pytest.raises(ScopeViolationError):
+            ro.enforce_shell(ro_bad)
+
+    assert ro.enforce_shell("git -C app status")
+    assert ro.enforce_shell("git --git-dir=.git status")
+
+
+def test_secondary_tool_gate_sdk_read_filename_and_hook_payload_options_cwd(tmp_path: Path) -> None:
+    """Verify shell-like argv gap, SDK kind=read fileName, hook options.cwd, targetFile, searchPath, and run_script."""
+    wt = tmp_path / "wt"
+    (wt / "app").mkdir(parents=True)
+    (wt / "app" / "ok.py").write_text("x = 1\n", encoding="utf-8")
+    (wt / ".thread").mkdir(parents=True)
+    (wt / ".thread" / "policy.yaml").write_text("base_branch: main\n", encoding="utf-8")
+
+    be = RolePolicy(
+        role="backend",
+        worktree_root=wt,
+        allowed_paths=["app/**"],
+        denied_paths=[".thread/**"],
+        allowed_shell_prefixes=["pytest"],
+    )
+    sdk_be = CopilotSdkAdapter(be)
+
+    # 1. All 5 gates deny run_terminal_command w/ path+argv, targetFile, searchPath, run_script raw
+    for bad_payload in (
+        {"toolName": "run_terminal_command", "toolArgs": {"path": "app/ok.py", "argv": ["rm", "-rf", "/"]}},
+        {"toolName": "read_file", "toolArgs": {"targetFile": "/etc/passwd"}},
+        {"toolName": "search", "toolArgs": {"searchPath": "/etc"}},
+        {"toolName": "run_script", "toolArgs": "rm -rf /"},
+        {"toolName": "run_script", "toolArgs": {"path": "app/ok.py", "argv": ["rm", "-rf", "/"]}},
+        {"toolName": "read_file", "options": {"cwd": "/etc"}, "toolArgs": {"path": "app/ok.py"}},
+        {"toolName": "write_file", "options": {"cwd": ".thread"}, "toolArgs": {"path": "policy.yaml"}},
+    ):
+        # Note: enforce_tool_call takes (toolName, toolArgs), so top-level payload options.cwd
+        # is verified via hook/SDK/CLI gates below and direct payloads without options.cwd via all 5 gates.
+        if "options" in bad_payload:
+            with pytest.raises(ScopeViolationError):
+                be.enforce_hook_payload(bad_payload)
+            assert asyncio.run(sdk_be._on_pre_tool_use(bad_payload))["permissionDecision"] == "deny"
+            dec = asyncio.run(sdk_be._on_permission_request({"kind": "custom-tool", **bad_payload}))
+            assert dec["kind"] == "denied-by-rules"
+            hook_proc = subprocess.run(
+                [sys.executable, "-m", "thread_sdlc.workers.permissions"],
+                input=json.dumps(bad_payload),
+                env={**os.environ, "THREAD_POLICY_JSON": json.dumps(be.to_dict())},
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            assert json.loads(hook_proc.stdout)["permissionDecision"] == "deny"
+        else:
+            _assert_denied_all_five_gates(be, wt, bad_payload)
+
+    # Object-style hook payload with nested options.cwd fails closed
+    class _HookObj:
+        toolName = "read_file"
+        options = {"cwd": "/etc"}
+        toolArgs = {"path": "app/ok.py"}
+
+    with pytest.raises(ScopeViolationError):
+        be.enforce_hook_payload(_HookObj())
+    assert asyncio.run(sdk_be._on_pre_tool_use(_HookObj()))["permissionDecision"] == "deny"
+
+    # 2. SDK kind="read" checks fileName & file_name even when path is present
+    for bad_read_req in (
+        {"kind": "read", "path": "app/ok.py", "fileName": "/etc/passwd"},
+        {"kind": "read", "path": "app/ok.py", "file_name": "../outside.txt"},
+        {"kind": "read", "fileName": "/etc/passwd"},
+    ):
+        dec = asyncio.run(sdk_be._on_permission_request(bad_read_req))
+        assert dec["kind"] == "denied-by-rules"
+
+    assert asyncio.run(sdk_be._on_permission_request({"kind": "read", "fileName": "app/ok.py"}))["kind"] == "approved"
+    assert be.enforce_hook_payload({"toolName": "read_file", "options": {"cwd": "app"}, "toolArgs": {"path": "ok.py"}}) == "read_file"
+    assert be.enforce_hook_payload({"toolName": "run_script", "toolArgs": "pytest -q"}) == "run_script"

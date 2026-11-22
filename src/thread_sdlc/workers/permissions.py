@@ -133,6 +133,20 @@ _READONLY_MUTATING_GIT_SUBCOMMANDS = frozenset(
         "stash",
         "am",
         "apply",
+        "rm",
+        "mv",
+        "config",
+        "init",
+        "clone",
+        "gc",
+        "remote",
+        "submodule",
+        "notes",
+        "replace",
+        "bisect",
+        "repack",
+        "prune",
+        "revert",
     }
 )
 
@@ -143,6 +157,7 @@ _PATH_ARG_KEYS = (
     "target_path",
     "targetPath",
     "target_file",
+    "targetFile",
     "TargetFile",
     "target_file_path",
     "targetFilePath",
@@ -278,6 +293,7 @@ _READ_EXTRA_PATH_KEYS = frozenset(
         "resolved_working_directory",
         "resolvedWorkingDirectory",
         "search_path",
+        "searchPath",
         "SearchPath",
         "search_paths",
         "searchPaths",
@@ -370,6 +386,7 @@ _SHELL_NAME_TOKENS = frozenset(
         "cli",
         "spawn",
         "process",
+        "script",
     }
 )
 
@@ -1063,10 +1080,12 @@ class RolePolicy:
                 "browser.",
             )
             subcmd: str | None = None
+            subcmd_idx: int | None = None
             expect_global_opt: str | None = None
             expect_git_output = False
             git_cwd = effective_cwd
             git_target_dirs: list[Path] = []
+            git_dir_targets: list[Path] = []
 
             def _validate_git_config_override(
                 cfg_spec: str, *, is_config_env: bool = False
@@ -1124,6 +1143,16 @@ class RolePolicy:
                     self.enforce_write(tok, base_dir=git_cwd)
                     continue
 
+                if tok in ("--upload-pack", "--receive-pack") or tok.startswith(
+                    ("--upload-pack=", "--receive-pack=")
+                ):
+                    raise ScopeViolationError(
+                        self.role,
+                        "shell",
+                        command,
+                        f"Git option {tok.split('=', 1)[0]!r} is disallowed by Thread role policy",
+                    )
+
                 if subcmd is None:
                     if expect_global_opt is not None:
                         opt_used = expect_global_opt
@@ -1132,7 +1161,8 @@ class RolePolicy:
                             git_cwd = self.enforce_read(tok, base_dir=git_cwd)
                             git_target_dirs.append(git_cwd)
                         elif opt_used == "--git-dir":
-                            self.enforce_read(tok, base_dir=effective_cwd)
+                            gd_dir = self.enforce_read(tok, base_dir=effective_cwd)
+                            git_dir_targets.append(gd_dir)
                         elif opt_used == "--work-tree":
                             wt_dir = self.enforce_read(tok, base_dir=effective_cwd)
                             git_target_dirs.append(wt_dir)
@@ -1142,6 +1172,14 @@ class RolePolicy:
                             _validate_git_config_override(tok, is_config_env=True)
                         # --namespace, --super-prefix, --attr-source take a value and are skipped
                         continue
+
+                    if tok == "--exec-path" or tok.startswith("--exec-path="):
+                        raise ScopeViolationError(
+                            self.role,
+                            "shell",
+                            command,
+                            "Git '--exec-path' option is disallowed by Thread role policy",
+                        )
 
                     if tok == "--":
                         break
@@ -1170,7 +1208,8 @@ class RolePolicy:
                         continue
                     if tok.startswith("--git-dir="):
                         _, val = tok.split("=", 1)
-                        self.enforce_read(val, base_dir=effective_cwd)
+                        gd_dir = self.enforce_read(val, base_dir=effective_cwd)
+                        git_dir_targets.append(gd_dir)
                         continue
                     if tok.startswith("--work-tree="):
                         _, val = tok.split("=", 1)
@@ -1186,13 +1225,13 @@ class RolePolicy:
                             "--namespace=",
                             "--super-prefix=",
                             "--attr-source=",
-                            "--exec-path=",
                             "--list-cmds=",
                         )
                     ):
                         continue
                     if not tok.startswith("-"):
                         subcmd = tok
+                        subcmd_idx = i
                         continue
 
                 if tok == "--output":
@@ -1251,18 +1290,192 @@ class RolePolicy:
                     f"Read-only role cannot execute mutating git command 'git {subcmd}'",
                 )
             if subcmd_lower in _READONLY_MUTATING_GIT_SUBCOMMANDS:
-                for gdir in git_target_dirs:
-                    rel_gdir = gdir.relative_to(self.worktree_root).as_posix()
-                    if rel_gdir != "." and any(
-                        glob_match(rel_gdir, pat)
+                def _enforce_git_write_dir(target_dir: Path, *, allow_root: bool = False) -> None:
+                    rel_dir = target_dir.relative_to(self.worktree_root).as_posix()
+                    if rel_dir == ".":
+                        if allow_root:
+                            return
+                        raise ScopeViolationError(
+                            self.role,
+                            "shell",
+                            command,
+                            f"Mutating git command 'git {subcmd}' targets worktree root '.' outside allowed_paths",
+                        )
+                    first_part = PurePosixPath(rel_dir).parts[0]
+                    if first_part in _ALWAYS_PROTECTED_PREFIXES:
+                        raise ScopeViolationError(
+                            self.role,
+                            "shell",
+                            command,
+                            f"Mutating git command 'git {subcmd}' targets protected directory {first_part!r}",
+                        )
+                    if any(
+                        glob_match(rel_dir, pat)
                         for pat in (*self.denied_paths, *self.deny_gate_files)
                     ):
                         raise ScopeViolationError(
                             self.role,
                             "shell",
                             command,
-                            f"Mutating git command 'git {subcmd}' targets denied directory {rel_gdir!r}",
+                            f"Mutating git command 'git {subcmd}' targets denied directory {rel_dir!r}",
                         )
+                    if not self.allowed_paths:
+                        raise ScopeViolationError(
+                            self.role,
+                            "shell",
+                            command,
+                            f"Mutating git command 'git {subcmd}' has no allowed_paths configured",
+                        )
+                    dir_parts = tuple(
+                        p for p in PurePosixPath(rel_dir).parts if p not in ("", ".")
+                    )
+                    if not any(
+                        glob_match(rel_dir, pat)
+                        or _pattern_can_match_under_dir(dir_parts, _normalize_pattern(pat))
+                        for pat in self.allowed_paths
+                    ):
+                        raise ScopeViolationError(
+                            self.role,
+                            "shell",
+                            command,
+                            f"Mutating git command 'git {subcmd}' targets directory {rel_dir!r} outside allowed_paths {self.allowed_paths}",
+                        )
+
+                for gd in git_dir_targets:
+                    _enforce_git_write_dir(gd, allow_root=False)
+                for gdir in git_target_dirs:
+                    _enforce_git_write_dir(gdir, allow_root=True)
+                if git_cwd != self.worktree_root:
+                    _enforce_git_write_dir(git_cwd, allow_root=True)
+
+                sub_tokens = tokens[subcmd_idx + 1 :] if subcmd_idx is not None else []
+                if subcmd_lower in ("init", "clone"):
+                    value_flags = (
+                        {
+                            "--template",
+                            "--separate-git-dir",
+                            "--shared",
+                            "-b",
+                            "--initial-branch",
+                            "--object-format",
+                            "--ref-format",
+                        }
+                        if subcmd_lower == "init"
+                        else {
+                            "-o",
+                            "--origin",
+                            "-b",
+                            "--branch",
+                            "-u",
+                            "--upload-pack",
+                            "--reference",
+                            "--reference-if-able",
+                            "--separate-git-dir",
+                            "--depth",
+                            "--shallow-since",
+                            "--shallow-exclude",
+                            "-c",
+                            "--config",
+                            "-j",
+                            "--jobs",
+                            "--template",
+                            "--filter",
+                            "--bundle-uri",
+                            "--server-option",
+                        }
+                    )
+                    expect_sub_val: str | None = None
+                    after_dd = False
+                    has_separate_gd = False
+                    pos_args: list[str] = []
+                    for st in sub_tokens:
+                        if expect_sub_val is not None:
+                            opt_name = expect_sub_val
+                            expect_sub_val = None
+                            if opt_name == "--separate-git-dir":
+                                has_separate_gd = True
+                                sep_gd = self.enforce_read(st, base_dir=git_cwd)
+                                _enforce_git_write_dir(sep_gd, allow_root=False)
+                            continue
+                        if after_dd:
+                            pos_args.append(st)
+                            continue
+                        if st == "--":
+                            after_dd = True
+                            continue
+                        if st in value_flags:
+                            if subcmd_lower == "clone" and (st == "-u" or st == "--upload-pack"):
+                                raise ScopeViolationError(
+                                    self.role,
+                                    "shell",
+                                    command,
+                                    f"Git clone option {st!r} is disallowed by Thread role policy",
+                                )
+                            expect_sub_val = st
+                            continue
+                        if subcmd_lower == "clone" and st.startswith("-u") and not st.startswith("--"):
+                            raise ScopeViolationError(
+                                self.role,
+                                "shell",
+                                command,
+                                "Git clone '-u' option is disallowed by Thread role policy",
+                            )
+                        if st.startswith("--separate-git-dir="):
+                            has_separate_gd = True
+                            _, sep_val = st.split("=", 1)
+                            sep_gd = self.enforce_read(sep_val, base_dir=git_cwd)
+                            _enforce_git_write_dir(sep_gd, allow_root=False)
+                            continue
+                        if st.startswith("-"):
+                            continue
+                        pos_args.append(st)
+                    if expect_sub_val is not None:
+                        raise ScopeViolationError(
+                            self.role,
+                            "shell",
+                            command,
+                            f"Missing value for git {subcmd_lower} option {expect_sub_val!r}",
+                        )
+                    if subcmd_lower == "init":
+                        if pos_args:
+                            init_dir = self.enforce_read(pos_args[0], base_dir=git_cwd)
+                            _enforce_git_write_dir(init_dir, allow_root=False)
+                        elif not git_dir_targets and not has_separate_gd:
+                            _enforce_git_write_dir(git_cwd / ".git", allow_root=False)
+                    else:  # clone
+                        if len(pos_args) >= 2:
+                            clone_dir = self.enforce_read(pos_args[1], base_dir=git_cwd)
+                            _enforce_git_write_dir(clone_dir, allow_root=False)
+                        elif len(pos_args) == 1:
+                            repo_spec = pos_args[0].rstrip("/\\")
+                            tail = repo_spec.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+                            if tail.endswith(".git"):
+                                tail = tail[:-4]
+                            derived = tail or "repo"
+                            clone_dir = self.enforce_read(derived, base_dir=git_cwd)
+                            _enforce_git_write_dir(clone_dir, allow_root=False)
+                        else:
+                            raise ScopeViolationError(
+                                self.role,
+                                "shell",
+                                command,
+                                "Missing repository argument for 'git clone'",
+                            )
+                elif subcmd_lower in ("checkout", "restore", "rm", "mv", "add"):
+                    after_dd = False
+                    pathspecs: list[str] = []
+                    for st in sub_tokens:
+                        if after_dd:
+                            pathspecs.append(st)
+                        elif st == "--":
+                            after_dd = True
+                        elif subcmd_lower in ("rm", "mv") and not st.startswith("-"):
+                            pathspecs.append(st)
+                    for ps in pathspecs:
+                        if ps == ".":
+                            _enforce_git_write_dir(git_cwd, allow_root=False)
+                        else:
+                            self.enforce_write(ps, base_dir=git_cwd)
 
         # Restrict inline code execution flags and `-m <module>` for python across all roles
         python_module: str | None = None
@@ -1680,6 +1893,7 @@ class RolePolicy:
         expect_pytest_cfg = False
         expect_pytest_rootdir = False
         expect_pytest_p = False
+        expect_pytest_p_can_disable = False
         has_explicit_pytest_cfg = False
         has_explicit_pytest_cache_dir = False
         has_explicit_pytest_rootdir = False
@@ -1755,12 +1969,30 @@ class RolePolicy:
                 expect_pytest_flag_val = False
                 if expect_pytest_p:
                     expect_pytest_p = False
-                    if tok == "no:cacheprovider":
+                    if expect_pytest_p_can_disable and tok == "no:cacheprovider":
                         has_no_cacheprovider = True
                     elif tok == "cacheprovider":
                         has_no_cacheprovider = False
+                    expect_pytest_p_can_disable = False
             elif in_pytest_section:
-                if pytest_after_double_dash:
+                if tok == "-p":
+                    expect_pytest_flag_val = True
+                    expect_pytest_p = True
+                    expect_pytest_p_can_disable = not pytest_after_double_dash
+                elif tok.startswith("-p") and not tok.startswith("--") and len(tok) > 2:
+                    if not pytest_after_double_dash and tok[2:] == "no:cacheprovider":
+                        has_no_cacheprovider = True
+                    elif tok[2:] == "cacheprovider":
+                        has_no_cacheprovider = False
+                elif not tok.startswith("--") and len(tok) > 2 and _parse_bundled_pytest_p(tok)[0]:
+                    _, bundled_p = _parse_bundled_pytest_p(tok)
+                    if bundled_p is None:
+                        expect_pytest_flag_val = True
+                        expect_pytest_p = True
+                        expect_pytest_p_can_disable = False
+                    elif bundled_p == "cacheprovider":
+                        has_no_cacheprovider = False
+                elif pytest_after_double_dash:
                     pytest_positional_args.append(tok)
                 elif tok == "--":
                     pytest_after_double_dash = True
@@ -1770,18 +2002,6 @@ class RolePolicy:
                     has_explicit_pytest_cfg = True
                 elif not tok.startswith("--") and len(tok) > 2 and _parse_bundled_pytest_c(tok)[0]:
                     has_explicit_pytest_cfg = True
-                elif tok == "-p":
-                    expect_pytest_flag_val = True
-                    expect_pytest_p = True
-                elif tok.startswith("-p") and not tok.startswith("--") and len(tok) > 2:
-                    if tok[2:] == "no:cacheprovider":
-                        has_no_cacheprovider = True
-                    elif tok[2:] == "cacheprovider":
-                        has_no_cacheprovider = False
-                elif not tok.startswith("--") and len(tok) > 2 and _parse_bundled_pytest_p(tok)[0]:
-                    _, bundled_p = _parse_bundled_pytest_p(tok)
-                    if bundled_p is None:
-                        expect_pytest_flag_val = True
                 elif tok in _PYTEST_VALUE_LONG_FLAGS or _pytest_short_flag_expects_next_value(tok):
                     expect_pytest_flag_val = True
 
@@ -2951,7 +3171,6 @@ class RolePolicy:
             is_shell_like
             and not shell_cmd_values
             and not isinstance(args.get("raw"), str)
-            and not self._extract_tool_paths(args, extra_keys=_READ_EXTRA_PATH_KEYS)
         ):
             raise ScopeViolationError(
                 self.role,
@@ -3101,43 +3320,95 @@ class RolePolicy:
                     )
             effective_args = dict(first_args)
 
-        top_cwds: dict[str, Any] = {}
-        for cwd_key in _SHELL_CWD_KEYS:
-            present, val = _get_field(cwd_key)
-            if present and val is not None:
-                top_cwds[cwd_key] = val
+        cmd_label = tool_name
+        if effective_args is not None:
+            for cmd_k in _SHELL_CMD_KEYS:
+                cmd_cand = effective_args.get(cmd_k)
+                if isinstance(cmd_cand, str) and cmd_cand.strip():
+                    cmd_label = cmd_cand
+                    break
 
-        if top_cwds:
-            cmd_label = tool_name
-            if effective_args is not None:
-                for cmd_k in _SHELL_CMD_KEYS:
-                    cmd_cand = effective_args.get(cmd_k)
-                    if isinstance(cmd_cand, str) and cmd_cand.strip():
-                        cmd_label = cmd_cand
-                        break
+        _payload_skip_keys = frozenset(
+            {"toolName", "tool_name", "toolArgs", "tool_args", "args", "arguments", "input"}
+        )
 
-            self._validate_shell_cwd_mapping(top_cwds, cmd_label)
+        def _payload_obj_to_cwd_tree(
+            obj: Any, seen: set[int], *, is_root: bool = False
+        ) -> Any:
+            if isinstance(obj, Mapping):
+                return {
+                    k: _payload_obj_to_cwd_tree(v, seen)
+                    for k, v in obj.items()
+                    if not (is_root and k in _payload_skip_keys)
+                }
+            if isinstance(obj, (list, tuple)):
+                return [_payload_obj_to_cwd_tree(item, seen) for item in obj]
+            if obj is None or isinstance(obj, (str, bytes, int, float, bool, Path)):
+                return obj
+            obj_id = id(obj)
+            if obj_id in seen:
+                return None
+            seen.add(obj_id)
+            out: dict[str, Any] = {}
+            for key in _SHELL_CWD_KEYS:
+                if hasattr(obj, key):
+                    val = getattr(obj, key)
+                    if val is not None:
+                        out[key] = _payload_obj_to_cwd_tree(val, seen)
+            for container_attr in ("options", "params", "context", "metadata", "config", "items"):
+                if hasattr(obj, container_attr):
+                    val = getattr(obj, container_attr)
+                    if val is not None:
+                        out[container_attr] = _payload_obj_to_cwd_tree(val, seen)
+            return out
 
+        if is_mapping:
+            payload_cwd_tree: Any = {
+                k: v for k, v in payload.items() if k not in _payload_skip_keys
+            }
+        else:
+            payload_cwd_tree = _payload_obj_to_cwd_tree(payload, set(), is_root=True)
+
+        payload_cwd_str, payload_resolved_cwd, _ = self._extract_and_validate_cwds(
+            payload_cwd_tree, cmd_label
+        )
+
+        if payload_cwd_str is not None:
             if effective_args is None:
-                effective_args = {}
-
-            for k, v in top_cwds.items():
-                if k in effective_args and effective_args[k] is not None:
-                    arg_v = effective_args[k]
+                effective_args = {"cwd": payload_cwd_str}
+            else:
+                for k in _SHELL_CWD_KEYS:
+                    present, v = _get_field(k)
                     if (
-                        not isinstance(arg_v, (str, Path))
-                        or str(arg_v).strip() != str(v).strip()
+                        present
+                        and v is not None
+                        and k in effective_args
+                        and effective_args[k] is not None
                     ):
+                        arg_v = effective_args[k]
+                        if (
+                            not isinstance(arg_v, (str, Path))
+                            or str(arg_v).strip() != str(v).strip()
+                        ):
+                            raise ScopeViolationError(
+                                self.role,
+                                "shell",
+                                str(effective_args.get("command") or cmd_label),
+                                f"Conflicting working directory between hook payload and toolArgs for {k!r}",
+                            )
+                args_cwd_str, args_resolved_cwd, _ = self._extract_and_validate_cwds(
+                    effective_args, cmd_label
+                )
+                if args_cwd_str is not None:
+                    if args_resolved_cwd != payload_resolved_cwd:
                         raise ScopeViolationError(
                             self.role,
                             "shell",
                             str(effective_args.get("command") or cmd_label),
-                            f"Conflicting working directory between hook payload and toolArgs for {k!r}",
+                            "Conflicting working directory between hook payload and toolArgs",
                         )
                 else:
-                    effective_args[k] = v
-
-            self._validate_shell_cwd_mapping(effective_args, cmd_label)
+                    effective_args["cwd"] = payload_cwd_str
 
         self.enforce_tool_call(tool_name, effective_args)
         return tool_name

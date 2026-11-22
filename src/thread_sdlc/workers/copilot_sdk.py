@@ -508,7 +508,7 @@ class CopilotSdkAdapter(BaseWorkerAdapter):
                 self._policy.enforce_shell(cmd, cwd=cwd_for_shell)
             elif kind == "read":
                 read_targets: list[str] = []
-                for attr in ("path", "resolved_path", "resolvedPath"):
+                for attr in ("file_name", "fileName", "path", "resolved_path", "resolvedPath"):
                     val = _extract_attr_or_key(request, attr)
                     if isinstance(val, str) and val.strip():
                         read_targets.append(val.strip())
