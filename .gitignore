@@ -12,6 +12,12 @@ htmlcov/
 
 # Thread durable local state & worktrees
 .thread-state/
+**/.thread/**/*.db
+**/.thread/**/*.db-*
+**/.thread/**/*.sqlite
+**/.thread/**/*.sqlite-*
+**/.thread/**/*.sqlite3
+**/.thread/**/*.sqlite3-*
 
 # Node / Web UI build dependencies (compiled output goes to src/thread_sdlc/ui/static/)
 web/node_modules/

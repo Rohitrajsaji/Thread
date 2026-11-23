@@ -2,7 +2,31 @@
 
 Installable, stack-agnostic, repository-native Agentic SDLC orchestrator for GitHub Copilot Business teams (VS Code Copilot Chat `@thread` + GitHub Copilot SDK/CLI) with a local `127.0.0.1` token-authenticated Approval & Review Web UI.
 
-## Quickstart
+## Install the CLI
+
+Thread requires Python 3.11 or later. Install directly from GitHub with pip or uv.
+
+```bash
+python -m pip install "git+https://github.com/Rohitrajsaji/Thread.git"
+# Or install the CLI in an isolated uv tool environment.
+uv tool install "git+https://github.com/Rohitrajsaji/Thread.git"
+```
+
+If you have a release wheel URL, install that artifact directly.
+
+```bash
+python -m pip install "<wheel-url>"
+```
+
+After building the wheel locally, install it from `dist/`.
+
+```bash
+python -m pip install ./dist/thread_sdlc-0.1.0-py3-none-any.whl
+thread --help
+thread doctor
+```
+
+## Develop locally
 
 ```bash
 uv venv --python 3.11 .venv
